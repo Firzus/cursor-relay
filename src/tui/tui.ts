@@ -165,8 +165,34 @@ export function formatAuthMeta(id: string, auth: AuthStatus | undefined): string
 
 // --- activity stream presenters (pure) ---------------------------------------
 
+/** Braille spinner frames + their advance interval (ms), for in-flight liveness. */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+const SPINNER_INTERVAL_MS = 80;
+
+/**
+ * The spinner frame for a given wall-clock `now`. Deterministic — the frame is
+ * a function of time, so two renders at the same instant agree and the ~100ms
+ * animation tick advances it smoothly. Pure.
+ */
+export function spinnerFrame(now: number): string {
+  const i = Math.floor(Math.max(0, now) / SPINNER_INTERVAL_MS) % SPINNER_FRAMES.length;
+  return SPINNER_FRAMES[i]!;
+}
+
+/**
+ * Live elapsed since a row started (`ts`), as a ticking timer: `1.5s` under a
+ * minute, `2m 3s` beyond. Takes an injected `now` so it is deterministic. Pure.
+ */
+export function formatElapsed(ts: number, now: number): string {
+  const ms = Math.max(0, now - ts);
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.floor((ms % 60_000) / 1000);
+  return `${m}m ${s}s`;
+}
+
 /** The kind of an activity column, so the mount can colour each segment. */
-export type ActivityCellKind = "time" | "status" | "source" | "tokens" | "note" | "duration";
+export type ActivityCellKind = "time" | "status" | "source" | "tokens" | "note" | "duration" | "elapsed";
 
 /** One plain-text column of an activity row, tagged for colouring. */
 export interface ActivityCell {
@@ -176,6 +202,7 @@ export interface ActivityCell {
 
 /** Shape an activity presenter reads — the columns it builds from. */
 interface ActivityRowInput {
+  ts: number;
   status: string;
   provider: string;
   model: string;
@@ -188,19 +215,25 @@ interface ActivityRowInput {
 
 /**
  * Ordered, plain-text columns for one activity row (left→right):
- * `time · status · provider/model · in→out (cached) · duration`. The 4th slot
- * carries the token witness on a normal row, or — on an error row with a note —
- * the note (truncated) so a failure is diagnosable inline. Empty slots (e.g. a
- * pending row with no tokens, or a row with no duration) are omitted. Colour is
- * the caller's job; this is pure and takes the already-formatted `timeStr` so
- * tests stay locale-independent.
+ * `time · status · provider/model · in→out (cached) · duration`. A pending row
+ * is live: its status slot animates a spinner (driven by `now`) and its tail
+ * slot shows a ticking elapsed timer in place of the duration. On a finalized
+ * row the 4th slot carries the token witness, or — on an error row with a note —
+ * the note (truncated) so a failure is diagnosable inline; empty slots are
+ * omitted. Colour is the caller's job; pure, and takes the already-formatted
+ * `timeStr` plus an injected `now` so tests stay deterministic.
  */
-export function activityColumns(row: ActivityRowInput, timeStr: string, noteMax = 32): ActivityCell[] {
-  const cells: ActivityCell[] = [
-    { text: timeStr, kind: "time" },
-    { text: row.status, kind: "status" },
-    { text: `${row.provider}/${row.model}`, kind: "source" },
-  ];
+export function activityColumns(row: ActivityRowInput, timeStr: string, now: number, noteMax = 32): ActivityCell[] {
+  const source = { text: `${row.provider}/${row.model}`, kind: "source" as const };
+  if (row.status === "pending") {
+    return [
+      { text: timeStr, kind: "time" },
+      { text: spinnerFrame(now), kind: "status" },
+      source,
+      { text: formatElapsed(row.ts, now), kind: "elapsed" },
+    ];
+  }
+  const cells: ActivityCell[] = [{ text: timeStr, kind: "time" }, { text: row.status, kind: "status" }, source];
   if (row.status === "error" && row.note) {
     cells.push({ text: truncateDetail(row.note, noteMax), kind: "note" });
   } else {
@@ -239,8 +272,9 @@ export function clipColumns(cells: ActivityCell[], width: number): ActivityCell[
 /** Single cyan accent for the chrome (border + title). Semantic status colors stay green/red/yellow. */
 const ACCENT = "#22d3ee";
 
-/** Cadences, decoupled so auth checks do not piggyback the fast data poll. */
+/** Cadences, decoupled so auth checks and animation do not piggyback the data poll. */
 const DATA_POLL_MS = 400;
+const RENDER_TICK_MS = 100;
 const AUTH_REFRESH_MS = 5000;
 
 /** A single space as a default-styled chunk, for inline gaps between styled segments. */
@@ -263,6 +297,8 @@ function colourCell(cell: ActivityCell): TextChunk {
       return cell.text === "ok" ? green(cell.text) : cell.text === "error" ? red(cell.text) : yellow(cell.text);
     case "note":
       return red(cell.text);
+    case "elapsed":
+      return yellow(cell.text);
     default:
       return dim(cell.text);
   }
@@ -270,11 +306,12 @@ function colourCell(cell: ActivityCell): TextChunk {
 
 /**
  * One activity row as a styled line: build the plain columns, clip them to the
- * available width (rightmost-first), then colour each surviving cell.
+ * available width (rightmost-first), then colour each surviving cell. `now`
+ * drives the spinner + live elapsed on a pending row.
  */
-function activityLine(row: ReturnType<typeof recentActivity>[number], width: number): StyledText {
+function activityLine(row: ReturnType<typeof recentActivity>[number], width: number, now: number): StyledText {
   const timeStr = new Date(row.ts).toLocaleTimeString();
-  const cells = clipColumns(activityColumns(row, timeStr), width);
+  const cells = clipColumns(activityColumns(row, timeStr, now), width);
   const chunks: TextChunk[] = [];
   cells.forEach((cell, i) => {
     if (i > 0) chunks.push(SPACE);
@@ -361,6 +398,21 @@ export async function runTui(): Promise<void> {
   app.add(metrics);
   renderer.root.add(app);
 
+  // Rows are read on the data poll and cached so the ~100ms animation tick can
+  // re-render the spinner + live elapsed of in-flight rows without re-hitting
+  // the store. The inner content area excludes the border (2 rows / 2 cols) and
+  // the horizontal padding (2 cols); fall back to a small size before first layout.
+  let cachedRows: ReturnType<typeof recentActivity> = [];
+  const streamInner = (): { h: number; w: number } => ({
+    h: stream.height > 2 ? stream.height - 2 : 8,
+    w: stream.width > 4 ? stream.width - 4 : 40,
+  });
+  const renderStream = (now: number): void => {
+    streamText.content = cachedRows.length
+      ? joinLines(cachedRows.map((r) => activityLine(r, streamInner().w, now)))
+      : new StyledText([dim("(no activity yet)")]);
+  };
+
   // --- render: data → props ------------------------------------------------
   const render = (): void => {
     const now = Date.now();
@@ -392,15 +444,10 @@ export async function runTui(): Promise<void> {
     }
     metaText.content = new StyledText(metaChunks);
 
-    // center: activity stream (newest first), auto-filling the pane. The inner
-    // content area excludes the border (2 rows / 2 cols) and the horizontal
-    // padding (2 cols); fall back to a small size before the first layout pass.
-    const innerHeight = stream.height > 2 ? stream.height - 2 : 8;
-    const innerWidth = stream.width > 4 ? stream.width - 4 : 40;
-    const rows = recentActivity(innerHeight);
-    streamText.content = rows.length
-      ? joinLines(rows.map((r) => activityLine(r, innerWidth)))
-      : new StyledText([dim("(no activity yet)")]);
+    // center: activity stream (newest first), auto-filling the pane — read and
+    // cache the rows, then render them with the current `now`.
+    cachedRows = recentActivity(streamInner().h);
+    renderStream(now);
 
     // bottom: cache rate + plan usage
     const lines: StyledText[] = [
@@ -462,10 +509,12 @@ export async function runTui(): Promise<void> {
   };
 
   let dataTimer: ReturnType<typeof setInterval> | undefined;
+  let renderTimer: ReturnType<typeof setInterval> | undefined;
   let authTimer: ReturnType<typeof setInterval> | undefined;
 
   const quit = (): void => {
     if (dataTimer) clearInterval(dataTimer);
+    if (renderTimer) clearInterval(renderTimer);
     if (authTimer) clearInterval(authTimer);
     renderer.destroy();
     process.exit(0);
@@ -489,12 +538,21 @@ export async function runTui(): Promise<void> {
 
   await refreshAuth();
   render();
-  // Data poll re-reads the store and updates props; auth refresh runs on a
-  // slower, decoupled cadence so authStatus() is not invoked several times a second.
+  // Data poll re-reads the store and updates every zone's props.
   dataTimer = setInterval(() => {
     sel = getSelection();
     render();
   }, DATA_POLL_MS);
+  // Animation tick advances the spinner + live elapsed of in-flight rows only,
+  // re-rendering the stream from the cached rows (no store read) and only while
+  // something is actually pending — so a quiet panel does no work.
+  renderTimer = setInterval(() => {
+    if (!cachedRows.some((r) => r.status === "pending")) return;
+    renderStream(Date.now());
+    renderer.requestRender();
+  }, RENDER_TICK_MS);
+  // Auth refresh runs on a slower, decoupled cadence so authStatus() is not
+  // invoked several times a second.
   authTimer = setInterval(() => {
     void refreshAuth();
   }, AUTH_REFRESH_MS);

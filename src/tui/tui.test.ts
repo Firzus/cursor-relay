@@ -8,9 +8,11 @@ import {
   formatActivityTokens,
   formatAuthMeta,
   formatCacheRate,
+  formatElapsed,
   formatEndpoint,
   formatPlanUsage,
   formatResetCountdown,
+  spinnerFrame,
   truncateDetail,
   usageLevel,
 } from "./tui.ts";
@@ -174,7 +176,9 @@ test("formatAuthMeta surfaces a down provider's error detail inline, truncated",
 
 // --- activity stream presenters ----------------------------------------------
 
+const FROZEN = 1_000_000_000_000;
 const baseRow = {
+  ts: FROZEN,
   status: "ok",
   provider: "claude",
   model: "claude-sonnet-4-6",
@@ -185,8 +189,23 @@ const baseRow = {
   cached_tokens: 11500 as number | null,
 };
 
+test("spinnerFrame is a deterministic function of now and wraps over the frames", () => {
+  expect(spinnerFrame(0)).toBe("⠋");
+  expect(spinnerFrame(80)).toBe("⠙");
+  expect(spinnerFrame(80 * 9)).toBe("⠏");
+  expect(spinnerFrame(80 * 10)).toBe("⠋"); // wraps back to the first frame
+  expect(spinnerFrame(-50)).toBe("⠋"); // clamped, never negative-indexes
+});
+
+test("formatElapsed ticks in seconds under a minute and m/s beyond", () => {
+  expect(formatElapsed(FROZEN, FROZEN)).toBe("0.0s");
+  expect(formatElapsed(FROZEN - 1500, FROZEN)).toBe("1.5s");
+  expect(formatElapsed(FROZEN - 65_000, FROZEN)).toBe("1m 5s");
+  expect(formatElapsed(FROZEN + 1000, FROZEN)).toBe("0.0s"); // future ts clamps to 0
+});
+
 test("activityColumns builds time·status·source·tokens·duration for an ok row", () => {
-  expect(activityColumns(baseRow, "12:00:00")).toEqual([
+  expect(activityColumns(baseRow, "12:00:00", FROZEN)).toEqual([
     { text: "12:00:00", kind: "time" },
     { text: "ok", kind: "status" },
     { text: "claude/claude-sonnet-4-6", kind: "source" },
@@ -195,25 +214,26 @@ test("activityColumns builds time·status·source·tokens·duration for an ok ro
   ]);
 });
 
-test("activityColumns omits the tokens slot on a pending row with no usage", () => {
-  const pending = { ...baseRow, status: "pending", prompt_tokens: null, completion_tokens: null, cached_tokens: null, duration_ms: null };
-  expect(activityColumns(pending, "12:00:00")).toEqual([
+test("activityColumns makes a pending row live: spinner status + elapsed tail", () => {
+  const pending = { ...baseRow, ts: FROZEN - 2300, status: "pending", prompt_tokens: null, completion_tokens: null, cached_tokens: null, duration_ms: null };
+  expect(activityColumns(pending, "12:00:00", FROZEN)).toEqual([
     { text: "12:00:00", kind: "time" },
-    { text: "pending", kind: "status" },
+    { text: spinnerFrame(FROZEN), kind: "status" },
     { text: "claude/claude-sonnet-4-6", kind: "source" },
+    { text: "2.3s", kind: "elapsed" },
   ]);
 });
 
 test("activityColumns puts a truncated note in the 4th slot for an error row", () => {
   const err = { ...baseRow, status: "error", note: "upstream 529 overloaded", prompt_tokens: null, completion_tokens: null, duration_ms: null };
-  expect(activityColumns(err, "12:00:00")).toEqual([
+  expect(activityColumns(err, "12:00:00", FROZEN)).toEqual([
     { text: "12:00:00", kind: "time" },
     { text: "error", kind: "status" },
     { text: "claude/claude-sonnet-4-6", kind: "source" },
     { text: "upstream 529 overloaded", kind: "note" },
   ]);
   const long = { ...err, note: "x".repeat(50) };
-  const cells = activityColumns(long, "12:00:00", 32);
+  const cells = activityColumns(long, "12:00:00", FROZEN, 32);
   expect(cells[3]).toEqual({ text: truncateDetail("x".repeat(50), 32), kind: "note" });
 });
 
