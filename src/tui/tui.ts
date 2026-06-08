@@ -163,6 +163,71 @@ export function formatAuthMeta(id: string, auth: AuthStatus | undefined): string
   return id;
 }
 
+// --- activity stream presenters (pure) ---------------------------------------
+
+/** The kind of an activity column, so the mount can colour each segment. */
+export type ActivityCellKind = "time" | "status" | "source" | "tokens" | "note" | "duration";
+
+/** One plain-text column of an activity row, tagged for colouring. */
+export interface ActivityCell {
+  text: string;
+  kind: ActivityCellKind;
+}
+
+/** Shape an activity presenter reads — the columns it builds from. */
+interface ActivityRowInput {
+  status: string;
+  provider: string;
+  model: string;
+  duration_ms: number | null;
+  note: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cached_tokens: number | null;
+}
+
+/**
+ * Ordered, plain-text columns for one activity row (left→right):
+ * `time · status · provider/model · in→out (cached) · duration`. The 4th slot
+ * carries the token witness on a normal row, or — on an error row with a note —
+ * the note (truncated) so a failure is diagnosable inline. Empty slots (e.g. a
+ * pending row with no tokens, or a row with no duration) are omitted. Colour is
+ * the caller's job; this is pure and takes the already-formatted `timeStr` so
+ * tests stay locale-independent.
+ */
+export function activityColumns(row: ActivityRowInput, timeStr: string, noteMax = 32): ActivityCell[] {
+  const cells: ActivityCell[] = [
+    { text: timeStr, kind: "time" },
+    { text: row.status, kind: "status" },
+    { text: `${row.provider}/${row.model}`, kind: "source" },
+  ];
+  if (row.status === "error" && row.note) {
+    cells.push({ text: truncateDetail(row.note, noteMax), kind: "note" });
+  } else {
+    const tokens = formatActivityTokens(row).trim();
+    if (tokens) cells.push({ text: tokens, kind: "tokens" });
+  }
+  if (row.duration_ms != null) cells.push({ text: `${row.duration_ms}ms`, kind: "duration" });
+  return cells;
+}
+
+/**
+ * Keep the leftmost columns that fit within `width` (joined by a single space),
+ * dropping the rightmost columns first so a narrow terminal sheds duration, then
+ * the token/note witness, etc., rather than wrapping. Pure.
+ */
+export function clipColumns(cells: ActivityCell[], width: number): ActivityCell[] {
+  const kept: ActivityCell[] = [];
+  let used = 0;
+  for (const cell of cells) {
+    const add = (kept.length ? 1 : 0) + cell.text.length;
+    if (used + add > width) break;
+    kept.push(cell);
+    used += add;
+  }
+  return kept;
+}
+
 // --- OpenTUI mount -----------------------------------------------------------
 //
 // The mount layer below is intentionally thin and untested: it builds the
@@ -191,19 +256,31 @@ function joinLines(lines: StyledText[]): StyledText {
   return new StyledText(chunks);
 }
 
-/** One activity row as a single styled line (color applied here, formatting in the presenters). */
-function activityLine(row: ReturnType<typeof recentActivity>[number]): StyledText {
-  const time = new Date(row.ts).toLocaleTimeString();
-  const status =
-    row.status === "ok" ? green(row.status) : row.status === "error" ? red(row.status) : yellow(row.status);
-  return new StyledText([
-    dim(time),
-    SPACE,
-    status,
-    dim(` ${row.provider}/${row.model}`),
-    dim(formatActivityTokens(row)),
-    dim(row.duration_ms != null ? ` ${row.duration_ms}ms` : ""),
-  ]);
+/** Colour one activity cell by its kind; formatting already happened in the presenter. */
+function colourCell(cell: ActivityCell): TextChunk {
+  switch (cell.kind) {
+    case "status":
+      return cell.text === "ok" ? green(cell.text) : cell.text === "error" ? red(cell.text) : yellow(cell.text);
+    case "note":
+      return red(cell.text);
+    default:
+      return dim(cell.text);
+  }
+}
+
+/**
+ * One activity row as a styled line: build the plain columns, clip them to the
+ * available width (rightmost-first), then colour each surviving cell.
+ */
+function activityLine(row: ReturnType<typeof recentActivity>[number], width: number): StyledText {
+  const timeStr = new Date(row.ts).toLocaleTimeString();
+  const cells = clipColumns(activityColumns(row, timeStr), width);
+  const chunks: TextChunk[] = [];
+  cells.forEach((cell, i) => {
+    if (i > 0) chunks.push(SPACE);
+    chunks.push(colourCell(cell));
+  });
+  return new StyledText(chunks);
 }
 
 /**
@@ -315,10 +392,14 @@ export async function runTui(): Promise<void> {
     }
     metaText.content = new StyledText(metaChunks);
 
-    // center: activity stream (newest first)
-    const rows = recentActivity(10);
+    // center: activity stream (newest first), auto-filling the pane. The inner
+    // content area excludes the border (2 rows / 2 cols) and the horizontal
+    // padding (2 cols); fall back to a small size before the first layout pass.
+    const innerHeight = stream.height > 2 ? stream.height - 2 : 8;
+    const innerWidth = stream.width > 4 ? stream.width - 4 : 40;
+    const rows = recentActivity(innerHeight);
     streamText.content = rows.length
-      ? joinLines(rows.map(activityLine))
+      ? joinLines(rows.map((r) => activityLine(r, innerWidth)))
       : new StyledText([dim("(no activity yet)")]);
 
     // bottom: cache rate + plan usage

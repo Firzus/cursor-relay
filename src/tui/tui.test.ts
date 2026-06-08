@@ -1,7 +1,10 @@
 import { test, expect } from "bun:test";
 import {
   abbreviateCount,
+  type ActivityCell,
+  activityColumns,
   authDotState,
+  clipColumns,
   formatActivityTokens,
   formatAuthMeta,
   formatCacheRate,
@@ -167,4 +170,63 @@ test("formatAuthMeta surfaces a down provider's error detail inline, truncated",
   );
   const long = "x".repeat(60);
   expect(formatAuthMeta("claude", { ok: false, detail: long })).toBe(`claude ${truncateDetail(long)}`);
+});
+
+// --- activity stream presenters ----------------------------------------------
+
+const baseRow = {
+  status: "ok",
+  provider: "claude",
+  model: "claude-sonnet-4-6",
+  duration_ms: 1234 as number | null,
+  note: null as string | null,
+  prompt_tokens: 12000 as number | null,
+  completion_tokens: 200 as number | null,
+  cached_tokens: 11500 as number | null,
+};
+
+test("activityColumns builds time·status·source·tokens·duration for an ok row", () => {
+  expect(activityColumns(baseRow, "12:00:00")).toEqual([
+    { text: "12:00:00", kind: "time" },
+    { text: "ok", kind: "status" },
+    { text: "claude/claude-sonnet-4-6", kind: "source" },
+    { text: "12000→200tok (cached 11.5k)", kind: "tokens" },
+    { text: "1234ms", kind: "duration" },
+  ]);
+});
+
+test("activityColumns omits the tokens slot on a pending row with no usage", () => {
+  const pending = { ...baseRow, status: "pending", prompt_tokens: null, completion_tokens: null, cached_tokens: null, duration_ms: null };
+  expect(activityColumns(pending, "12:00:00")).toEqual([
+    { text: "12:00:00", kind: "time" },
+    { text: "pending", kind: "status" },
+    { text: "claude/claude-sonnet-4-6", kind: "source" },
+  ]);
+});
+
+test("activityColumns puts a truncated note in the 4th slot for an error row", () => {
+  const err = { ...baseRow, status: "error", note: "upstream 529 overloaded", prompt_tokens: null, completion_tokens: null, duration_ms: null };
+  expect(activityColumns(err, "12:00:00")).toEqual([
+    { text: "12:00:00", kind: "time" },
+    { text: "error", kind: "status" },
+    { text: "claude/claude-sonnet-4-6", kind: "source" },
+    { text: "upstream 529 overloaded", kind: "note" },
+  ]);
+  const long = { ...err, note: "x".repeat(50) };
+  const cells = activityColumns(long, "12:00:00", 32);
+  expect(cells[3]).toEqual({ text: truncateDetail("x".repeat(50), 32), kind: "note" });
+});
+
+test("clipColumns drops the rightmost columns first as width shrinks", () => {
+  const cells: ActivityCell[] = [
+    { text: "AAAA", kind: "time" }, // 4
+    { text: "BB", kind: "status" }, // +1+2 = 7
+    { text: "CCC", kind: "source" }, // +1+3 = 11
+    { text: "DD", kind: "duration" }, // +1+2 = 14
+  ];
+  expect(clipColumns(cells, 14).map((c) => c.kind)).toEqual(["time", "status", "source", "duration"]);
+  expect(clipColumns(cells, 13).map((c) => c.kind)).toEqual(["time", "status", "source"]); // duration drops
+  expect(clipColumns(cells, 10).map((c) => c.kind)).toEqual(["time", "status"]); // source drops
+  expect(clipColumns(cells, 6).map((c) => c.kind)).toEqual(["time"]); // status drops
+  expect(clipColumns(cells, 3)).toEqual([]); // even time does not fit
 });
