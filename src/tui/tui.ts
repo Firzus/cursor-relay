@@ -1,4 +1,18 @@
-import pc from "picocolors";
+import {
+  BoxRenderable,
+  bold,
+  createCliRenderer,
+  cyan,
+  dim,
+  green,
+  type KeyEvent,
+  red,
+  StyledText,
+  stringToStyledText,
+  type TextChunk,
+  TextRenderable,
+  yellow,
+} from "@opentui/core";
 import { PORT, TUNNEL_HOSTNAME } from "../config.ts";
 import { allProviders, getProvider } from "../providers/registry.ts";
 import {
@@ -7,11 +21,13 @@ import {
   getPlanUsage,
   getSelection,
   nextPeriod,
+  pendingCount,
   type Period,
   periodSince,
   type PlanWindow,
   recentActivity,
   setSelection,
+  windowedCounters,
 } from "../store/state.ts";
 import type { AuthStatus, Effort, ProviderId, Selection } from "../providers/types.ts";
 
@@ -89,6 +105,18 @@ export function formatPlanUsage(label: string, window: PlanWindow, now: number):
 }
 
 /**
+ * Optimistic reset: once `now` passes a window's reset boundary, force its
+ * utilization to 0 before formatting, so a passed reset reads as a fresh 0%
+ * window rather than a stale frozen percent. Otherwise the window is returned
+ * untouched. Pure — the accepted under-report trade-off is documented in
+ * ADR-0002 (plan usage is the authoritative signal, captured from headers).
+ */
+export function optimisticReset(window: PlanWindow, now: number): PlanWindow {
+  if (now > window.resetAt) return { ...window, utilization: 0 };
+  return window;
+}
+
+/**
  * Render the cache-rate line body (without color) for the active period.
  * Returns the dim dash form when there is no usable input data in the window.
  */
@@ -99,11 +127,240 @@ export function formatCacheRate(totals: { cached: number; input: number }, perio
 }
 
 /**
+ * The counters line for the metrics panel: requests + errors over the selected
+ * window, plus the live in-flight count (point-in-time, not windowed). Counts
+ * are abbreviated like the rest of the panel. Pure.
+ */
+export function formatCounters(c: { requests: number; errors: number; inFlight: number }): string {
+  return `requests ${abbreviateCount(c.requests)}  ·  errors ${abbreviateCount(c.errors)}  ·  in-flight ${abbreviateCount(c.inFlight)}`;
+}
+
+/** Minimum terminal size the three-zone chrome needs to render legibly. */
+export const MIN_COLS = 60;
+export const MIN_ROWS = 10;
+
+/**
+ * Whether the terminal is too small for the full chrome — below the minimum the
+ * panel degrades to a clear message instead of breaking. Pure.
+ */
+export function isTerminalTooSmall(cols: number, rows: number): boolean {
+  return cols < MIN_COLS || rows < MIN_ROWS;
+}
+
+// --- status bar presenters (pure) --------------------------------------------
+
+/** Semantic state of a provider auth dot, mapped to colour by the caller. */
+export type AuthDotState = "ok" | "down" | "pending";
+
+/**
+ * Map an auth status (or its absence, before the first check) to a dot state.
+ * `pending` is the dim "not checked yet" state; `down` carries an error the
+ * caller surfaces inline. Pure.
+ */
+export function authDotState(auth: AuthStatus | undefined): AuthDotState {
+  if (!auth) return "pending";
+  return auth.ok ? "ok" : "down";
+}
+
+/** Endpoint URL + tunnel state for the meta strip. `up` when a tunnel hostname is configured. */
+export interface EndpointInfo {
+  url: string;
+  tunnel: "up" | "off";
+}
+
+/**
+ * Where Cursor should point, plus whether a tunnel fronts it. The TUI only
+ * knows the configured hostname (it does not run the tunnel), so `up` means
+ * "a public hostname is configured", `off` means local-only. Pure.
+ */
+export function formatEndpoint(tunnelHostname: string, port: number): EndpointInfo {
+  if (tunnelHostname) return { url: `https://${tunnelHostname}/v1`, tunnel: "up" };
+  return { url: `http://127.0.0.1:${port}/v1`, tunnel: "off" };
+}
+
+/**
+ * Truncate an inline detail (e.g. a down provider's auth error) to `max`
+ * characters, appending an ellipsis when cut, so a long message cannot blow out
+ * the meta strip. Pure.
+ */
+export function truncateDetail(detail: string, max = 48): string {
+  if (detail.length <= max) return detail;
+  return `${detail.slice(0, max - 1)}…`;
+}
+
+/**
+ * The inline label for one provider in the meta strip: just the id when the
+ * provider is ok or unchecked, or `id detail` (truncated) when it is down — so
+ * an auth failure is diagnosable without leaving the panel. Pure.
+ */
+export function formatAuthMeta(id: string, auth: AuthStatus | undefined): string {
+  if (auth && !auth.ok && auth.detail) return `${id} ${truncateDetail(auth.detail)}`;
+  return id;
+}
+
+// --- activity stream presenters (pure) ---------------------------------------
+
+/** Braille spinner frames + their advance interval (ms), for in-flight liveness. */
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] as const;
+const SPINNER_INTERVAL_MS = 80;
+
+/**
+ * The spinner frame for a given wall-clock `now`. Deterministic — the frame is
+ * a function of time, so two renders at the same instant agree and the ~100ms
+ * animation tick advances it smoothly. Pure.
+ */
+export function spinnerFrame(now: number): string {
+  const i = Math.floor(Math.max(0, now) / SPINNER_INTERVAL_MS) % SPINNER_FRAMES.length;
+  return SPINNER_FRAMES[i]!;
+}
+
+/**
+ * Live elapsed since a row started (`ts`), as a ticking timer: `1.5s` under a
+ * minute, `2m 3s` beyond. Takes an injected `now` so it is deterministic. Pure.
+ */
+export function formatElapsed(ts: number, now: number): string {
+  const ms = Math.max(0, now - ts);
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  const s = Math.floor((ms % 60_000) / 1000);
+  return `${m}m ${s}s`;
+}
+
+/** The kind of an activity column, so the mount can colour each segment. */
+export type ActivityCellKind = "time" | "status" | "source" | "tokens" | "note" | "duration" | "elapsed";
+
+/** One plain-text column of an activity row, tagged for colouring. */
+export interface ActivityCell {
+  text: string;
+  kind: ActivityCellKind;
+}
+
+/** Shape an activity presenter reads — the columns it builds from. */
+interface ActivityRowInput {
+  ts: number;
+  status: string;
+  provider: string;
+  model: string;
+  duration_ms: number | null;
+  note: string | null;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  cached_tokens: number | null;
+}
+
+/**
+ * Ordered, plain-text columns for one activity row (left→right):
+ * `time · status · provider/model · in→out (cached) · duration`. A pending row
+ * is live: its status slot animates a spinner (driven by `now`) and its tail
+ * slot shows a ticking elapsed timer in place of the duration. On a finalized
+ * row the 4th slot carries the token witness, or — on an error row with a note —
+ * the note (truncated) so a failure is diagnosable inline; empty slots are
+ * omitted. Colour is the caller's job; pure, and takes the already-formatted
+ * `timeStr` plus an injected `now` so tests stay deterministic.
+ */
+export function activityColumns(row: ActivityRowInput, timeStr: string, now: number, noteMax = 32): ActivityCell[] {
+  const source = { text: `${row.provider}/${row.model}`, kind: "source" as const };
+  if (row.status === "pending") {
+    return [
+      { text: timeStr, kind: "time" },
+      { text: spinnerFrame(now), kind: "status" },
+      source,
+      { text: formatElapsed(row.ts, now), kind: "elapsed" },
+    ];
+  }
+  const cells: ActivityCell[] = [{ text: timeStr, kind: "time" }, { text: row.status, kind: "status" }, source];
+  if (row.status === "error" && row.note) {
+    cells.push({ text: truncateDetail(row.note, noteMax), kind: "note" });
+  } else {
+    const tokens = formatActivityTokens(row).trim();
+    if (tokens) cells.push({ text: tokens, kind: "tokens" });
+  }
+  if (row.duration_ms != null) cells.push({ text: `${row.duration_ms}ms`, kind: "duration" });
+  return cells;
+}
+
+/**
+ * Keep the leftmost columns that fit within `width` (joined by a single space),
+ * dropping the rightmost columns first so a narrow terminal sheds duration, then
+ * the token/note witness, etc., rather than wrapping. Pure.
+ */
+export function clipColumns(cells: ActivityCell[], width: number): ActivityCell[] {
+  const kept: ActivityCell[] = [];
+  let used = 0;
+  for (const cell of cells) {
+    const add = (kept.length ? 1 : 0) + cell.text.length;
+    if (used + add > width) break;
+    kept.push(cell);
+    used += add;
+  }
+  return kept;
+}
+
+// --- OpenTUI mount -----------------------------------------------------------
+//
+// The mount layer below is intentionally thin and untested: it builds the
+// chrome (three zones) once and pushes fresh StyledText into the Text
+// renderables on each cadence. All formatting decisions live in the pure
+// presenters above; the native core owns differential rendering (no flicker)
+// and the Yoga flexbox layout (the chrome structure).
+
+/** Single cyan accent for the chrome (border + title). Semantic status colors stay green/red/yellow. */
+const ACCENT = "#22d3ee";
+
+/** Cadences, decoupled so auth checks and animation do not piggyback the data poll. */
+const DATA_POLL_MS = 400;
+const RENDER_TICK_MS = 100;
+const AUTH_REFRESH_MS = 5000;
+
+/** A single space as a default-styled chunk, for inline gaps between styled segments. */
+const SPACE: TextChunk = stringToStyledText(" ").chunks[0]!;
+
+/** Join per-line StyledText fragments into one multi-line StyledText for a Text renderable. */
+function joinLines(lines: StyledText[]): StyledText {
+  const chunks: TextChunk[] = [];
+  lines.forEach((line, i) => {
+    if (i > 0) chunks.push(...stringToStyledText("\n").chunks);
+    chunks.push(...line.chunks);
+  });
+  return new StyledText(chunks);
+}
+
+/** Colour one activity cell by its kind; formatting already happened in the presenter. */
+function colourCell(cell: ActivityCell): TextChunk {
+  switch (cell.kind) {
+    case "status":
+      return cell.text === "ok" ? green(cell.text) : cell.text === "error" ? red(cell.text) : yellow(cell.text);
+    case "note":
+      return red(cell.text);
+    case "elapsed":
+      return yellow(cell.text);
+    default:
+      return dim(cell.text);
+  }
+}
+
+/**
+ * One activity row as a styled line: build the plain columns, clip them to the
+ * available width (rightmost-first), then colour each surviving cell. `now`
+ * drives the spinner + live elapsed on a pending row.
+ */
+function activityLine(row: ReturnType<typeof recentActivity>[number], width: number, now: number): StyledText {
+  const timeStr = new Date(row.ts).toLocaleTimeString();
+  const cells = clipColumns(activityColumns(row, timeStr, now), width);
+  const chunks: TextChunk[] = [];
+  cells.forEach((cell, i) => {
+    if (i > 0) chunks.push(SPACE);
+    chunks.push(colourCell(cell));
+  });
+  return new StyledText(chunks);
+}
+
+/**
  * Live control panel. Reads selection + activity from the shared store and
  * writes the selection back when you cycle it — that store is the control
  * channel to the background service.
  *
- *   p cycle provider · m cycle model · e cycle effort · q quit
+ *   p cycle provider · m cycle model · e cycle effort · w window · q quit
  */
 export async function runTui(): Promise<void> {
   const providers = allProviders();
@@ -122,65 +379,199 @@ export async function runTui(): Promise<void> {
     }
   };
 
+  const renderer = await createCliRenderer({ exitOnCtrlC: false, targetFps: 30 });
+
+  // --- chrome: three zones, built once -------------------------------------
+  const app = new BoxRenderable(renderer, {
+    id: "app",
+    width: "100%",
+    height: "100%",
+    flexDirection: "column",
+  });
+
+  const statusBar = new BoxRenderable(renderer, {
+    id: "status",
+    flexDirection: "column",
+    paddingLeft: 1,
+    paddingRight: 1,
+  });
+  const selText = new TextRenderable(renderer, { id: "sel", content: "" });
+  const metaText = new TextRenderable(renderer, { id: "meta", content: "" });
+  statusBar.add(selText);
+  statusBar.add(metaText);
+
+  const stream = new BoxRenderable(renderer, {
+    id: "stream",
+    flexGrow: 1,
+    border: true,
+    borderStyle: "rounded",
+    borderColor: ACCENT,
+    title: " activity ",
+    titleColor: ACCENT,
+    paddingLeft: 1,
+    paddingRight: 1,
+  });
+  const streamText = new TextRenderable(renderer, { id: "streamText", content: "" });
+  stream.add(streamText);
+
+  const metrics = new BoxRenderable(renderer, {
+    id: "metrics",
+    border: true,
+    borderStyle: "single",
+    borderColor: ACCENT,
+    flexDirection: "column",
+    paddingLeft: 1,
+    paddingRight: 1,
+  });
+  // Two sub-areas side by side: plan usage on the left (slice 6), windowed cache
+  // rate + counters on the right; the keybind hints sit on the last line.
+  const metricsRow = new BoxRenderable(renderer, { id: "metricsRow", flexDirection: "row" });
+  const metricsLeft = new BoxRenderable(renderer, { id: "metricsLeft", flexGrow: 1 });
+  const metricsRight = new BoxRenderable(renderer, { id: "metricsRight", flexGrow: 1 });
+  const planText = new TextRenderable(renderer, { id: "plan", content: "" });
+  const rightText = new TextRenderable(renderer, { id: "right", content: "" });
+  metricsLeft.add(planText);
+  metricsRight.add(rightText);
+  metricsRow.add(metricsLeft);
+  metricsRow.add(metricsRight);
+  const hintsText = new TextRenderable(renderer, { id: "hints", content: "" });
+  metrics.add(metricsRow);
+  metrics.add(hintsText);
+
+  app.add(statusBar);
+  app.add(stream);
+  app.add(metrics);
+  renderer.root.add(app);
+
+  // Min-size guard: an absolute overlay (out of the app's flow) shown when the
+  // terminal is too small, so the panel degrades to a clear message rather than
+  // rendering a broken layout.
+  const guard = new BoxRenderable(renderer, {
+    id: "guard",
+    position: "absolute",
+    top: 0,
+    left: 0,
+    width: "100%",
+    height: "100%",
+    justifyContent: "center",
+    alignItems: "center",
+    visible: false,
+  });
+  const guardText = new TextRenderable(renderer, { id: "guardText", content: "" });
+  guard.add(guardText);
+  renderer.root.add(guard);
+
+  // Rows are read on the data poll and cached so the ~100ms animation tick can
+  // re-render the spinner + live elapsed of in-flight rows without re-hitting
+  // the store. The inner content area excludes the border (2 rows / 2 cols) and
+  // the horizontal padding (2 cols); fall back to a small size before first layout.
+  let cachedRows: ReturnType<typeof recentActivity> = [];
+  const streamInner = (): { h: number; w: number } => ({
+    h: stream.height > 2 ? stream.height - 2 : 8,
+    w: stream.width > 4 ? stream.width - 4 : 40,
+  });
+  const renderStream = (now: number): void => {
+    streamText.content = cachedRows.length
+      ? joinLines(cachedRows.map((r) => activityLine(r, streamInner().w, now)))
+      : new StyledText([dim("(no activity yet)")]);
+  };
+
+  // Collapse the plan-usage sub-area (width 0, hidden) when the active provider
+  // has no plan usage, so the cache-rate + counters sub-area reclaims the space;
+  // guarded so the layout only reflows on an actual state change.
+  let planCollapsed = false;
+  const setPlanCollapsed = (collapsed: boolean): void => {
+    if (collapsed === planCollapsed) return;
+    planCollapsed = collapsed;
+    metricsLeft.visible = !collapsed;
+    metricsLeft.flexGrow = collapsed ? 0 : 1;
+    metricsLeft.width = collapsed ? 0 : "auto";
+  };
+
+  // --- render: data → props ------------------------------------------------
   const render = (): void => {
-    const lines: string[] = [];
-    lines.push(pc.bold(pc.cyan("  shim ")) + pc.dim("· multi-provider proxy for Cursor"));
-    const base = TUNNEL_HOSTNAME ? `https://${TUNNEL_HOSTNAME}/v1` : pc.yellow(`http://127.0.0.1:${PORT}/v1 (no tunnel)`);
-    lines.push(pc.dim(`  endpoint  `) + base);
-    lines.push("");
+    const now = Date.now();
 
-    lines.push(pc.bold("  Active selection"));
-    lines.push(
-      `    provider ${pc.green(sel.provider)}   model ${pc.green(sel.model)}   effort ${pc.green(sel.effort)}`,
-    );
-    lines.push("");
+    // min-size guard: below the threshold, hide the chrome and show one centered
+    // message; the overlay is absolute so the app's layout is untouched.
+    if (isTerminalTooSmall(renderer.terminalWidth, renderer.terminalHeight)) {
+      app.visible = false;
+      guard.visible = true;
+      guardText.content = new StyledText([yellow(`terminal too small — need at least ${MIN_COLS}×${MIN_ROWS}`)]);
+      renderer.requestRender();
+      return;
+    }
+    app.visible = true;
+    guard.visible = false;
 
-    lines.push(pc.bold("  Providers"));
+    // tier 1: active selection, highlighted as the control anchor (bold accent
+    // values, dim labels) so the operator always knows which backend serves traffic.
+    selText.content = new StyledText([
+      bold(cyan("shim")),
+      dim("  provider "),
+      bold(cyan(sel.provider)),
+      dim("  model "),
+      bold(cyan(sel.model)),
+      dim("  effort "),
+      bold(cyan(sel.effort)),
+    ]);
+
+    // tier 2: dim meta strip — endpoint, tunnel state, and per-provider auth
+    // dots; a down provider surfaces its error detail inline.
+    const endpoint = formatEndpoint(TUNNEL_HOSTNAME, PORT);
+    const metaChunks: TextChunk[] = [
+      dim(`${endpoint.url}  `),
+      endpoint.tunnel === "up" ? green("tunnel up") : yellow("no tunnel"),
+    ];
     for (const p of providers) {
       const a = authCache.get(p.id);
-      const badge = a ? (a.ok ? pc.green("● ok") : pc.red("● " + a.detail)) : pc.dim("…");
-      lines.push(`    ${p.id.padEnd(8)} ${badge}`);
+      const state = authDotState(a);
+      const dot = state === "ok" ? green("●") : state === "down" ? red("●") : dim("●");
+      metaChunks.push(SPACE, SPACE, dot, dim(` ${formatAuthMeta(p.id, a)}`));
     }
-    lines.push("");
+    metaText.content = new StyledText(metaChunks);
 
-    lines.push(pc.bold("  Recent activity"));
-    const rows = recentActivity(8);
-    if (!rows.length) {
-      lines.push(pc.dim("    (none yet)"));
+    // center: activity stream (newest first), auto-filling the pane — read and
+    // cache the rows, then render them with the current `now`.
+    cachedRows = recentActivity(streamInner().h);
+    renderStream(now);
+
+    // bottom-left: plan usage, scoped to the active provider. A provider that
+    // does not capture plan usage (e.g. codex) collapses the block so the right
+    // sub-area reclaims the space; a capable provider with no snapshot yet shows
+    // "no data yet"; otherwise two bars, each optimistically reset once its
+    // window's reset boundary has passed.
+    const provider = getProvider(sel.provider);
+    if (!provider.reportsPlanUsage) {
+      setPlanCollapsed(true);
     } else {
-      for (const r of rows) {
-        const t = new Date(r.ts).toLocaleTimeString();
-        const seg = formatActivityTokens(r);
-        const tok = seg ? pc.dim(seg) : "";
-        const dur = r.duration_ms != null ? pc.dim(` ${r.duration_ms}ms`) : "";
-        const status = r.status === "ok" ? pc.green(r.status) : r.status === "error" ? pc.red(r.status) : pc.yellow(r.status);
-        lines.push(`    ${pc.dim(t)} ${r.provider}/${r.model} ${status}${tok}${dur}`);
+      setPlanCollapsed(false);
+      const usage = getPlanUsage(sel.provider);
+      if (!usage) {
+        planText.content = new StyledText([dim(`plan usage (${sel.provider})  (no data yet)`)]);
+      } else {
+        const bar = (label: string, raw: PlanWindow): StyledText => {
+          const w = optimisticReset(raw, now);
+          const lvl = usageLevel(w.utilization);
+          const color = lvl === "crit" ? red : lvl === "warn" ? yellow : green;
+          return new StyledText([color(formatPlanUsage(label, w, now))]);
+        };
+        planText.content = joinLines([bar("5h", usage.fiveHour), bar("weekly", usage.weekly)]);
       }
     }
-    lines.push("");
 
-    lines.push(pc.bold("  Cache"));
-    lines.push(pc.dim(`    ${formatCacheRate(cacheTotals(periodSince(period, Date.now())), period)}`));
-    lines.push("");
+    // bottom-right: windowed cache rate + counters. The `w` period scopes the
+    // cache rate AND the request/error counters together; in-flight is live.
+    const since = periodSince(period, now);
+    const counters = { ...windowedCounters(since), inFlight: pendingCount() };
+    rightText.content = joinLines([
+      new StyledText([dim(formatCacheRate(cacheTotals(since), period))]),
+      new StyledText([dim(formatCounters(counters))]),
+    ]);
 
-    lines.push(pc.bold("  Plan usage") + pc.dim(" (claude)"));
-    const usage = getPlanUsage("claude");
-    if (!usage) {
-      lines.push(pc.dim("    (no data yet)"));
-    } else {
-      const now = Date.now();
-      const bar = (label: string, w: PlanWindow): string => {
-        const lvl = usageLevel(w.utilization);
-        const colour = lvl === "crit" ? pc.red : lvl === "warn" ? pc.yellow : pc.green;
-        return `    ${colour(formatPlanUsage(label, w, now))}`;
-      };
-      lines.push(bar("5h", usage.fiveHour));
-      lines.push(bar("weekly", usage.weekly));
-    }
-    lines.push("");
-    lines.push(pc.dim("  p provider · m model · e effort · w window · q quit"));
+    hintsText.content = new StyledText([dim("p provider · m model · e effort · w window · q quit")]);
 
-    process.stdout.write("\x1b[2J\x1b[H" + lines.join("\n") + "\n");
+    renderer.requestRender();
   };
 
   const commit = (next: Selection): void => {
@@ -220,45 +611,57 @@ export async function runTui(): Promise<void> {
     render();
   };
 
-  let timer: ReturnType<typeof setInterval> | undefined;
-
-  const stdin = process.stdin;
-  stdin.setRawMode?.(true);
-  stdin.resume();
-  stdin.setEncoding("utf8");
+  let dataTimer: ReturnType<typeof setInterval> | undefined;
+  let renderTimer: ReturnType<typeof setInterval> | undefined;
+  let authTimer: ReturnType<typeof setInterval> | undefined;
 
   const quit = (): void => {
-    if (timer) clearInterval(timer);
-    stdin.setRawMode?.(false);
-    process.stdout.write("\n");
+    if (dataTimer) clearInterval(dataTimer);
+    if (renderTimer) clearInterval(renderTimer);
+    if (authTimer) clearInterval(authTimer);
+    renderer.destroy();
     process.exit(0);
   };
 
-  stdin.on("data", (key: string) => {
-    switch (key) {
+  renderer.keyInput.on("keypress", (key: KeyEvent) => {
+    if (key.ctrl && key.name === "c") return quit();
+    switch (key.name) {
       case "p":
-        cycleProvider();
-        break;
+        return cycleProvider();
       case "m":
-        cycleModel();
-        break;
+        return cycleModel();
       case "e":
-        cycleEffort();
-        break;
+        return cycleEffort();
       case "w":
-        cyclePeriod();
-        break;
+        return cyclePeriod();
       case "q":
-      case "": // Ctrl-C
-        quit();
-        break;
+        return quit();
     }
   });
 
+  // Reflow immediately on terminal resize (Yoga relayouts the flex zones; this
+  // re-derives the size-dependent content — stream auto-fill/clip and the
+  // min-size guard — without waiting for the next poll).
+  renderer.on("resize", () => render());
+
   await refreshAuth();
   render();
-  timer = setInterval(() => {
+  // Data poll re-reads the store and updates every zone's props.
+  dataTimer = setInterval(() => {
     sel = getSelection();
-    void refreshAuth().then(render);
-  }, 2000);
+    render();
+  }, DATA_POLL_MS);
+  // Animation tick advances the spinner + live elapsed of in-flight rows only,
+  // re-rendering the stream from the cached rows (no store read) and only while
+  // something is actually pending — so a quiet panel does no work.
+  renderTimer = setInterval(() => {
+    if (!cachedRows.some((r) => r.status === "pending")) return;
+    renderStream(Date.now());
+    renderer.requestRender();
+  }, RENDER_TICK_MS);
+  // Auth refresh runs on a slower, decoupled cadence so authStatus() is not
+  // invoked several times a second.
+  authTimer = setInterval(() => {
+    void refreshAuth();
+  }, AUTH_REFRESH_MS);
 }

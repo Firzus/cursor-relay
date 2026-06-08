@@ -1,10 +1,24 @@
 import { test, expect } from "bun:test";
 import {
   abbreviateCount,
+  type ActivityCell,
+  activityColumns,
+  authDotState,
+  clipColumns,
   formatActivityTokens,
+  formatAuthMeta,
   formatCacheRate,
+  formatCounters,
+  formatElapsed,
+  formatEndpoint,
   formatPlanUsage,
   formatResetCountdown,
+  isTerminalTooSmall,
+  MIN_COLS,
+  MIN_ROWS,
+  optimisticReset,
+  spinnerFrame,
+  truncateDetail,
   usageLevel,
 } from "./tui.ts";
 
@@ -68,6 +82,20 @@ test("formatPlanUsage clamps utilization into the bar and percent", () => {
   ).toBe("5h     [██████████] 100%  resets in 1m");
 });
 
+test("optimisticReset forces utilization to 0 once now passes the reset boundary", () => {
+  const now = 1_000_000_000_000;
+  const window = { utilization: 0.71, resetAt: now - 1, status: "allowed" };
+  expect(optimisticReset(window, now)).toEqual({ utilization: 0, resetAt: now - 1, status: "allowed" });
+});
+
+test("optimisticReset leaves a window untouched before and exactly at the reset", () => {
+  const now = 1_000_000_000_000;
+  const future = { utilization: 0.71, resetAt: now + 1, status: "allowed" };
+  expect(optimisticReset(future, now)).toBe(future); // before reset: same reference, untouched
+  const atBoundary = { utilization: 0.71, resetAt: now, status: "allowed" };
+  expect(optimisticReset(atBoundary, now)).toBe(atBoundary); // not strictly past yet
+});
+
 test("formatActivityTokens shows the cached witness when cache reads landed", () => {
   expect(
     formatActivityTokens({ prompt_tokens: 12000, completion_tokens: 200, cached_tokens: 11500 }),
@@ -124,4 +152,139 @@ test("formatCacheRate shows a dim dash when there is no usable input", () => {
 
 test("formatCacheRate treats negative input as the empty state", () => {
   expect(formatCacheRate({ cached: 0, input: -5 }, "24h")).toBe("cache rate (24h)  —");
+});
+
+test("isTerminalTooSmall guards below the minimum on either axis", () => {
+  expect(isTerminalTooSmall(MIN_COLS, MIN_ROWS)).toBe(false); // exactly at the minimum is fine
+  expect(isTerminalTooSmall(MIN_COLS - 1, MIN_ROWS)).toBe(true); // too narrow
+  expect(isTerminalTooSmall(MIN_COLS, MIN_ROWS - 1)).toBe(true); // too short
+  expect(isTerminalTooSmall(120, 40)).toBe(false); // roomy
+});
+
+test("formatCounters renders requests, errors, and the live in-flight count", () => {
+  expect(formatCounters({ requests: 128, errors: 3, inFlight: 2 })).toBe(
+    "requests 128  ·  errors 3  ·  in-flight 2",
+  );
+});
+
+test("formatCounters abbreviates large counts like the rest of the panel", () => {
+  expect(formatCounters({ requests: 12_000, errors: 0, inFlight: 0 })).toBe(
+    "requests 12k  ·  errors 0  ·  in-flight 0",
+  );
+});
+
+// --- status bar presenters ---------------------------------------------------
+
+test("authDotState maps absence to pending, ok to ok, and not-ok to down", () => {
+  expect(authDotState(undefined)).toBe("pending");
+  expect(authDotState({ ok: true, detail: "max plan" })).toBe("ok");
+  expect(authDotState({ ok: false, detail: "credentials not found" })).toBe("down");
+});
+
+test("formatEndpoint prefers the public tunnel hostname when configured", () => {
+  expect(formatEndpoint("proxy.example.com", 8787)).toEqual({
+    url: "https://proxy.example.com/v1",
+    tunnel: "up",
+  });
+});
+
+test("formatEndpoint falls back to the local address with tunnel off", () => {
+  expect(formatEndpoint("", 8787)).toEqual({ url: "http://127.0.0.1:8787/v1", tunnel: "off" });
+});
+
+test("truncateDetail leaves short details intact and ellipsizes long ones", () => {
+  expect(truncateDetail("credentials not found")).toBe("credentials not found");
+  expect(truncateDetail("0123456789", 5)).toBe("0123…");
+  expect(truncateDetail("01234", 5)).toBe("01234"); // exactly at the limit, untouched
+});
+
+test("formatAuthMeta shows just the id when ok, unchecked, or detail-less", () => {
+  expect(formatAuthMeta("claude", { ok: true, detail: "max plan" })).toBe("claude");
+  expect(formatAuthMeta("codex", undefined)).toBe("codex");
+  expect(formatAuthMeta("claude", { ok: false, detail: "" })).toBe("claude");
+});
+
+test("formatAuthMeta surfaces a down provider's error detail inline, truncated", () => {
+  expect(formatAuthMeta("claude", { ok: false, detail: "token expired" })).toBe(
+    "claude token expired",
+  );
+  const long = "x".repeat(60);
+  expect(formatAuthMeta("claude", { ok: false, detail: long })).toBe(`claude ${truncateDetail(long)}`);
+});
+
+// --- activity stream presenters ----------------------------------------------
+
+const FROZEN = 1_000_000_000_000;
+const baseRow = {
+  ts: FROZEN,
+  status: "ok",
+  provider: "claude",
+  model: "claude-sonnet-4-6",
+  duration_ms: 1234 as number | null,
+  note: null as string | null,
+  prompt_tokens: 12000 as number | null,
+  completion_tokens: 200 as number | null,
+  cached_tokens: 11500 as number | null,
+};
+
+test("spinnerFrame is a deterministic function of now and wraps over the frames", () => {
+  expect(spinnerFrame(0)).toBe("⠋");
+  expect(spinnerFrame(80)).toBe("⠙");
+  expect(spinnerFrame(80 * 9)).toBe("⠏");
+  expect(spinnerFrame(80 * 10)).toBe("⠋"); // wraps back to the first frame
+  expect(spinnerFrame(-50)).toBe("⠋"); // clamped, never negative-indexes
+});
+
+test("formatElapsed ticks in seconds under a minute and m/s beyond", () => {
+  expect(formatElapsed(FROZEN, FROZEN)).toBe("0.0s");
+  expect(formatElapsed(FROZEN - 1500, FROZEN)).toBe("1.5s");
+  expect(formatElapsed(FROZEN - 65_000, FROZEN)).toBe("1m 5s");
+  expect(formatElapsed(FROZEN + 1000, FROZEN)).toBe("0.0s"); // future ts clamps to 0
+});
+
+test("activityColumns builds time·status·source·tokens·duration for an ok row", () => {
+  expect(activityColumns(baseRow, "12:00:00", FROZEN)).toEqual([
+    { text: "12:00:00", kind: "time" },
+    { text: "ok", kind: "status" },
+    { text: "claude/claude-sonnet-4-6", kind: "source" },
+    { text: "12000→200tok (cached 11.5k)", kind: "tokens" },
+    { text: "1234ms", kind: "duration" },
+  ]);
+});
+
+test("activityColumns makes a pending row live: spinner status + elapsed tail", () => {
+  const pending = { ...baseRow, ts: FROZEN - 2300, status: "pending", prompt_tokens: null, completion_tokens: null, cached_tokens: null, duration_ms: null };
+  expect(activityColumns(pending, "12:00:00", FROZEN)).toEqual([
+    { text: "12:00:00", kind: "time" },
+    { text: spinnerFrame(FROZEN), kind: "status" },
+    { text: "claude/claude-sonnet-4-6", kind: "source" },
+    { text: "2.3s", kind: "elapsed" },
+  ]);
+});
+
+test("activityColumns puts a truncated note in the 4th slot for an error row", () => {
+  const err = { ...baseRow, status: "error", note: "upstream 529 overloaded", prompt_tokens: null, completion_tokens: null, duration_ms: null };
+  expect(activityColumns(err, "12:00:00", FROZEN)).toEqual([
+    { text: "12:00:00", kind: "time" },
+    { text: "error", kind: "status" },
+    { text: "claude/claude-sonnet-4-6", kind: "source" },
+    { text: "upstream 529 overloaded", kind: "note" },
+  ]);
+  const long = { ...err, note: "x".repeat(50) };
+  const cells = activityColumns(long, "12:00:00", FROZEN, 32);
+  expect(cells[3]).toEqual({ text: truncateDetail("x".repeat(50), 32), kind: "note" });
+});
+
+test("clipColumns drops the rightmost columns first as width shrinks", () => {
+  const cells: ActivityCell[] = [
+    { text: "AAAA", kind: "time" }, // 4
+    { text: "BB", kind: "status" }, // +1+2 = 7
+    { text: "CCC", kind: "source" }, // +1+3 = 11
+    { text: "DD", kind: "duration" }, // +1+2 = 14
+  ];
+  expect(clipColumns(cells, 14).map((c) => c.kind)).toEqual(["time", "status", "source", "duration"]);
+  expect(clipColumns(cells, 13).map((c) => c.kind)).toEqual(["time", "status", "source"]); // duration drops
+  expect(clipColumns(cells, 10).map((c) => c.kind)).toEqual(["time", "status"]); // source drops
+  expect(clipColumns(cells, 6).map((c) => c.kind)).toEqual(["time"]); // status drops
+  expect(clipColumns(cells, 3)).toEqual([]); // even time does not fit
 });
