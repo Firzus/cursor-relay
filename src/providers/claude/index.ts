@@ -4,6 +4,8 @@ import { safeResponseText } from "../../http.ts";
 import { anthropicStreamToOpenAI, buildAnthropicRequest } from "./translate.ts";
 import { callClaude } from "./upstream.ts";
 import { authStatus, getAuth, invalidateAuthCache } from "./auth.ts";
+import { parseAnthropicRateLimitHeaders } from "./usage.ts";
+import { recordPlanUsage } from "../../store/state.ts";
 
 /**
  * Claude provider — Anthropic Messages API via Claude Code OAuth.
@@ -50,6 +52,25 @@ export const claudeProvider: Provider = {
         ? await safeResponseText(res, { limit: 500, fallback: "<unreadable>" })
         : "<no body>";
       throw new ProviderError(`Anthropic ${res.status}: ${text}`, res.status, text);
+    }
+
+    // Capture plan usage from headers (separate from the body stream, so this
+    // never affects what Cursor receives). Parsing is cheap and inline; the
+    // sqlite write is deferred so it stays off the path that returns the stream.
+    // Best-effort throughout — telemetry must never break a request.
+    try {
+      const snapshot = parseAnthropicRateLimitHeaders(res.headers);
+      if (snapshot) {
+        queueMicrotask(() => {
+          try {
+            recordPlanUsage("claude", snapshot);
+          } catch {
+            // ignore — usage capture is best-effort
+          }
+        });
+      }
+    } catch {
+      // ignore — header parsing is best-effort
     }
 
     return anthropicStreamToOpenAI(res.body, {
