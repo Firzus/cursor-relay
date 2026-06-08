@@ -1,4 +1,18 @@
-import pc from "picocolors";
+import {
+  BoxRenderable,
+  bold,
+  createCliRenderer,
+  cyan,
+  dim,
+  green,
+  type KeyEvent,
+  red,
+  StyledText,
+  stringToStyledText,
+  type TextChunk,
+  TextRenderable,
+  yellow,
+} from "@opentui/core";
 import { PORT, TUNNEL_HOSTNAME } from "../config.ts";
 import { allProviders, getProvider } from "../providers/registry.ts";
 import {
@@ -98,12 +112,55 @@ export function formatCacheRate(totals: { cached: number; input: number }, perio
   return `cache rate (${period})  ${pct}%  (${abbreviateCount(totals.cached)} cached / ${abbreviateCount(totals.input)} input)`;
 }
 
+// --- OpenTUI mount -----------------------------------------------------------
+//
+// The mount layer below is intentionally thin and untested: it builds the
+// chrome (three zones) once and pushes fresh StyledText into the Text
+// renderables on each cadence. All formatting decisions live in the pure
+// presenters above; the native core owns differential rendering (no flicker)
+// and the Yoga flexbox layout (the chrome structure).
+
+/** Single cyan accent for the chrome (border + title). Semantic status colors stay green/red/yellow. */
+const ACCENT = "#22d3ee";
+
+/** Cadences, decoupled so auth checks do not piggyback the fast data poll. */
+const DATA_POLL_MS = 400;
+const AUTH_REFRESH_MS = 5000;
+
+/** A single space as a default-styled chunk, for inline gaps between styled segments. */
+const SPACE: TextChunk = stringToStyledText(" ").chunks[0]!;
+
+/** Join per-line StyledText fragments into one multi-line StyledText for a Text renderable. */
+function joinLines(lines: StyledText[]): StyledText {
+  const chunks: TextChunk[] = [];
+  lines.forEach((line, i) => {
+    if (i > 0) chunks.push(...stringToStyledText("\n").chunks);
+    chunks.push(...line.chunks);
+  });
+  return new StyledText(chunks);
+}
+
+/** One activity row as a single styled line (color applied here, formatting in the presenters). */
+function activityLine(row: ReturnType<typeof recentActivity>[number]): StyledText {
+  const time = new Date(row.ts).toLocaleTimeString();
+  const status =
+    row.status === "ok" ? green(row.status) : row.status === "error" ? red(row.status) : yellow(row.status);
+  return new StyledText([
+    dim(time),
+    SPACE,
+    status,
+    dim(` ${row.provider}/${row.model}`),
+    dim(formatActivityTokens(row)),
+    dim(row.duration_ms != null ? ` ${row.duration_ms}ms` : ""),
+  ]);
+}
+
 /**
  * Live control panel. Reads selection + activity from the shared store and
  * writes the selection back when you cycle it — that store is the control
  * channel to the background service.
  *
- *   p cycle provider · m cycle model · e cycle effort · q quit
+ *   p cycle provider · m cycle model · e cycle effort · w window · q quit
  */
 export async function runTui(): Promise<void> {
   const providers = allProviders();
@@ -122,65 +179,111 @@ export async function runTui(): Promise<void> {
     }
   };
 
+  const renderer = await createCliRenderer({ exitOnCtrlC: false, targetFps: 30 });
+
+  // --- chrome: three zones, built once -------------------------------------
+  const app = new BoxRenderable(renderer, {
+    id: "app",
+    width: "100%",
+    height: "100%",
+    flexDirection: "column",
+  });
+
+  const statusBar = new BoxRenderable(renderer, {
+    id: "status",
+    flexDirection: "column",
+    paddingLeft: 1,
+    paddingRight: 1,
+  });
+  const selText = new TextRenderable(renderer, { id: "sel", content: "" });
+  const metaText = new TextRenderable(renderer, { id: "meta", content: "" });
+  statusBar.add(selText);
+  statusBar.add(metaText);
+
+  const stream = new BoxRenderable(renderer, {
+    id: "stream",
+    flexGrow: 1,
+    border: true,
+    borderStyle: "rounded",
+    borderColor: ACCENT,
+    title: " activity ",
+    titleColor: ACCENT,
+    paddingLeft: 1,
+    paddingRight: 1,
+  });
+  const streamText = new TextRenderable(renderer, { id: "streamText", content: "" });
+  stream.add(streamText);
+
+  const metrics = new BoxRenderable(renderer, {
+    id: "metrics",
+    border: true,
+    borderStyle: "single",
+    borderColor: ACCENT,
+    flexDirection: "column",
+    paddingLeft: 1,
+    paddingRight: 1,
+  });
+  const metricsText = new TextRenderable(renderer, { id: "metricsText", content: "" });
+  const hintsText = new TextRenderable(renderer, { id: "hints", content: "" });
+  metrics.add(metricsText);
+  metrics.add(hintsText);
+
+  app.add(statusBar);
+  app.add(stream);
+  app.add(metrics);
+  renderer.root.add(app);
+
+  // --- render: data → props ------------------------------------------------
   const render = (): void => {
-    const lines: string[] = [];
-    lines.push(pc.bold(pc.cyan("  shim ")) + pc.dim("· multi-provider proxy for Cursor"));
-    const base = TUNNEL_HOSTNAME ? `https://${TUNNEL_HOSTNAME}/v1` : pc.yellow(`http://127.0.0.1:${PORT}/v1 (no tunnel)`);
-    lines.push(pc.dim(`  endpoint  `) + base);
-    lines.push("");
+    const now = Date.now();
 
-    lines.push(pc.bold("  Active selection"));
-    lines.push(
-      `    provider ${pc.green(sel.provider)}   model ${pc.green(sel.model)}   effort ${pc.green(sel.effort)}`,
-    );
-    lines.push("");
+    // tier 1: active selection (control anchor)
+    selText.content = new StyledText([
+      bold(cyan("shim ")),
+      dim("· provider "),
+      green(sel.provider),
+      dim("  model "),
+      green(sel.model),
+      dim("  effort "),
+      green(sel.effort),
+    ]);
 
-    lines.push(pc.bold("  Providers"));
+    // tier 2: endpoint + provider auth (refined into a richer meta strip in slice 2)
+    const endpoint = TUNNEL_HOSTNAME ? `https://${TUNNEL_HOSTNAME}/v1` : `http://127.0.0.1:${PORT}/v1 (no tunnel)`;
+    const metaChunks: TextChunk[] = [dim("endpoint "), TUNNEL_HOSTNAME ? dim(endpoint) : yellow(endpoint)];
     for (const p of providers) {
       const a = authCache.get(p.id);
-      const badge = a ? (a.ok ? pc.green("● ok") : pc.red("● " + a.detail)) : pc.dim("…");
-      lines.push(`    ${p.id.padEnd(8)} ${badge}`);
+      const dot = a ? (a.ok ? green("●") : red("●")) : dim("…");
+      metaChunks.push(dim("  "), dot, dim(` ${p.id}`));
     }
-    lines.push("");
+    metaText.content = new StyledText(metaChunks);
 
-    lines.push(pc.bold("  Recent activity"));
-    const rows = recentActivity(8);
-    if (!rows.length) {
-      lines.push(pc.dim("    (none yet)"));
-    } else {
-      for (const r of rows) {
-        const t = new Date(r.ts).toLocaleTimeString();
-        const seg = formatActivityTokens(r);
-        const tok = seg ? pc.dim(seg) : "";
-        const dur = r.duration_ms != null ? pc.dim(` ${r.duration_ms}ms`) : "";
-        const status = r.status === "ok" ? pc.green(r.status) : r.status === "error" ? pc.red(r.status) : pc.yellow(r.status);
-        lines.push(`    ${pc.dim(t)} ${r.provider}/${r.model} ${status}${tok}${dur}`);
-      }
-    }
-    lines.push("");
+    // center: activity stream (newest first)
+    const rows = recentActivity(10);
+    streamText.content = rows.length
+      ? joinLines(rows.map(activityLine))
+      : new StyledText([dim("(no activity yet)")]);
 
-    lines.push(pc.bold("  Cache"));
-    lines.push(pc.dim(`    ${formatCacheRate(cacheTotals(periodSince(period, Date.now())), period)}`));
-    lines.push("");
-
-    lines.push(pc.bold("  Plan usage") + pc.dim(" (claude)"));
+    // bottom: cache rate + plan usage
+    const lines: StyledText[] = [
+      new StyledText([dim(formatCacheRate(cacheTotals(periodSince(period, now)), period))]),
+    ];
     const usage = getPlanUsage("claude");
     if (!usage) {
-      lines.push(pc.dim("    (no data yet)"));
+      lines.push(new StyledText([dim("plan usage (claude)  (no data yet)")]));
     } else {
-      const now = Date.now();
-      const bar = (label: string, w: PlanWindow): string => {
+      const bar = (label: string, w: PlanWindow): StyledText => {
         const lvl = usageLevel(w.utilization);
-        const colour = lvl === "crit" ? pc.red : lvl === "warn" ? pc.yellow : pc.green;
-        return `    ${colour(formatPlanUsage(label, w, now))}`;
+        const color = lvl === "crit" ? red : lvl === "warn" ? yellow : green;
+        return new StyledText([color(formatPlanUsage(label, w, now))]);
       };
-      lines.push(bar("5h", usage.fiveHour));
-      lines.push(bar("weekly", usage.weekly));
+      lines.push(bar("5h", usage.fiveHour), bar("weekly", usage.weekly));
     }
-    lines.push("");
-    lines.push(pc.dim("  p provider · m model · e effort · w window · q quit"));
+    metricsText.content = joinLines(lines);
 
-    process.stdout.write("\x1b[2J\x1b[H" + lines.join("\n") + "\n");
+    hintsText.content = new StyledText([dim("p provider · m model · e effort · w window · q quit")]);
+
+    renderer.requestRender();
   };
 
   const commit = (next: Selection): void => {
@@ -220,45 +323,41 @@ export async function runTui(): Promise<void> {
     render();
   };
 
-  let timer: ReturnType<typeof setInterval> | undefined;
-
-  const stdin = process.stdin;
-  stdin.setRawMode?.(true);
-  stdin.resume();
-  stdin.setEncoding("utf8");
+  let dataTimer: ReturnType<typeof setInterval> | undefined;
+  let authTimer: ReturnType<typeof setInterval> | undefined;
 
   const quit = (): void => {
-    if (timer) clearInterval(timer);
-    stdin.setRawMode?.(false);
-    process.stdout.write("\n");
+    if (dataTimer) clearInterval(dataTimer);
+    if (authTimer) clearInterval(authTimer);
+    renderer.destroy();
     process.exit(0);
   };
 
-  stdin.on("data", (key: string) => {
-    switch (key) {
+  renderer.keyInput.on("keypress", (key: KeyEvent) => {
+    if (key.ctrl && key.name === "c") return quit();
+    switch (key.name) {
       case "p":
-        cycleProvider();
-        break;
+        return cycleProvider();
       case "m":
-        cycleModel();
-        break;
+        return cycleModel();
       case "e":
-        cycleEffort();
-        break;
+        return cycleEffort();
       case "w":
-        cyclePeriod();
-        break;
+        return cyclePeriod();
       case "q":
-      case "": // Ctrl-C
-        quit();
-        break;
+        return quit();
     }
   });
 
   await refreshAuth();
   render();
-  timer = setInterval(() => {
+  // Data poll re-reads the store and updates props; auth refresh runs on a
+  // slower, decoupled cadence so authStatus() is not invoked several times a second.
+  dataTimer = setInterval(() => {
     sel = getSelection();
-    void refreshAuth().then(render);
-  }, 2000);
+    render();
+  }, DATA_POLL_MS);
+  authTimer = setInterval(() => {
+    void refreshAuth();
+  }, AUTH_REFRESH_MS);
 }
