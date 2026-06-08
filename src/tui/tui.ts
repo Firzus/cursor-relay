@@ -135,6 +135,18 @@ export function formatCounters(c: { requests: number; errors: number; inFlight: 
   return `requests ${abbreviateCount(c.requests)}  ·  errors ${abbreviateCount(c.errors)}  ·  in-flight ${abbreviateCount(c.inFlight)}`;
 }
 
+/** Minimum terminal size the three-zone chrome needs to render legibly. */
+export const MIN_COLS = 60;
+export const MIN_ROWS = 10;
+
+/**
+ * Whether the terminal is too small for the full chrome — below the minimum the
+ * panel degrades to a clear message instead of breaking. Pure.
+ */
+export function isTerminalTooSmall(cols: number, rows: number): boolean {
+  return cols < MIN_COLS || rows < MIN_ROWS;
+}
+
 // --- status bar presenters (pure) --------------------------------------------
 
 /** Semantic state of a provider auth dot, mapped to colour by the caller. */
@@ -431,6 +443,24 @@ export async function runTui(): Promise<void> {
   app.add(metrics);
   renderer.root.add(app);
 
+  // Min-size guard: an absolute overlay (out of the app's flow) shown when the
+  // terminal is too small, so the panel degrades to a clear message rather than
+  // rendering a broken layout.
+  const guard = new BoxRenderable(renderer, {
+    id: "guard",
+    position: "absolute",
+    top: 0,
+    left: 0,
+    width: "100%",
+    height: "100%",
+    justifyContent: "center",
+    alignItems: "center",
+    visible: false,
+  });
+  const guardText = new TextRenderable(renderer, { id: "guardText", content: "" });
+  guard.add(guardText);
+  renderer.root.add(guard);
+
   // Rows are read on the data poll and cached so the ~100ms animation tick can
   // re-render the spinner + live elapsed of in-flight rows without re-hitting
   // the store. The inner content area excludes the border (2 rows / 2 cols) and
@@ -461,6 +491,18 @@ export async function runTui(): Promise<void> {
   // --- render: data → props ------------------------------------------------
   const render = (): void => {
     const now = Date.now();
+
+    // min-size guard: below the threshold, hide the chrome and show one centered
+    // message; the overlay is absolute so the app's layout is untouched.
+    if (isTerminalTooSmall(renderer.terminalWidth, renderer.terminalHeight)) {
+      app.visible = false;
+      guard.visible = true;
+      guardText.content = new StyledText([yellow(`terminal too small — need at least ${MIN_COLS}×${MIN_ROWS}`)]);
+      renderer.requestRender();
+      return;
+    }
+    app.visible = true;
+    guard.visible = false;
 
     // tier 1: active selection, highlighted as the control anchor (bold accent
     // values, dim labels) so the operator always knows which backend serves traffic.
@@ -596,6 +638,11 @@ export async function runTui(): Promise<void> {
         return quit();
     }
   });
+
+  // Reflow immediately on terminal resize (Yoga relayouts the flex zones; this
+  // re-derives the size-dependent content — stream auto-fill/clip and the
+  // min-size guard — without waiting for the next poll).
+  renderer.on("resize", () => render());
 
   await refreshAuth();
   render();

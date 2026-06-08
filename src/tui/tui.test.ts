@@ -13,6 +13,9 @@ import {
   formatEndpoint,
   formatPlanUsage,
   formatResetCountdown,
+  isTerminalTooSmall,
+  MIN_COLS,
+  MIN_ROWS,
   optimisticReset,
   spinnerFrame,
   truncateDetail,
@@ -149,6 +152,13 @@ test("formatCacheRate shows a dim dash when there is no usable input", () => {
 
 test("formatCacheRate treats negative input as the empty state", () => {
   expect(formatCacheRate({ cached: 0, input: -5 }, "24h")).toBe("cache rate (24h)  —");
+});
+
+test("isTerminalTooSmall guards below the minimum on either axis", () => {
+  expect(isTerminalTooSmall(MIN_COLS, MIN_ROWS)).toBe(false); // exactly at the minimum is fine
+  expect(isTerminalTooSmall(MIN_COLS - 1, MIN_ROWS)).toBe(true); // too narrow
+  expect(isTerminalTooSmall(MIN_COLS, MIN_ROWS - 1)).toBe(true); // too short
+  expect(isTerminalTooSmall(120, 40)).toBe(false); // roomy
 });
 
 test("formatCounters renders requests, errors, and the live in-flight count", () => {
