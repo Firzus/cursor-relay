@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "bun run src/index.ts",
-    "dev": "bun --watch run src/index.ts",
+    "serve": "bun run src/index.ts serve",
+    "dev": "bun --watch run src/index.ts serve",
     "tui": "bun run src/index.ts tui",
     "up": "bun run src/index.ts up",
     "down": "bun run src/index.ts down",

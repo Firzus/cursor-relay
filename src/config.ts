@@ -6,8 +6,8 @@ export function parsePositiveIntEnv(name: string, fallback: number): number {
 }
 
 export const PORT = parsePositiveIntEnv("PORT", 8787);
-export const MAX_CONCURRENCY = parsePositiveIntEnv("SHIM_MAX_CONCURRENCY", 20);
-export const DEBUG = process.env.SHIM_DEBUG === "1" || process.env.SHIM_DEBUG === "true";
+export const MAX_CONCURRENCY = parsePositiveIntEnv("MAX_CONCURRENCY", 20);
+export const DEBUG_LOG = process.env.DEBUG_LOG === "1" || process.env.DEBUG_LOG === "true";
 
 export const TUNNEL_TOKEN = process.env.CLOUDFLARE_TUNNEL_TOKEN ?? "";
 export const TUNNEL_HOSTNAME = process.env.CLOUDFLARE_TUNNEL_HOSTNAME ?? "";

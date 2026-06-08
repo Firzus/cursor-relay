@@ -1,7 +1,7 @@
 import pc from "picocolors";
 import { PORT, SENTINEL_MODEL, TUNNEL_HOSTNAME, TUNNEL_TOKEN } from "./config.ts";
 import { startServer } from "./server/server.ts";
-import { startTunnel } from "./tunnel.ts";
+import { openTunnel } from "./tunnel.ts";
 import { installShutdown, onShutdown } from "./shutdown.ts";
 import { runTui } from "./tui/tui.ts";
 import { installService, uninstallService } from "./service.ts";
@@ -14,7 +14,7 @@ export async function run(argv: string[]): Promise<void> {
   const cmd = argv[2] ?? "tui";
   switch (cmd) {
     case "serve":
-      serve();
+      await serve();
       return;
     case "tui":
     case "":
@@ -46,22 +46,26 @@ export async function run(argv: string[]): Promise<void> {
   }
 }
 
-function serve(): void {
+async function serve(): Promise<void> {
   installShutdown();
   const server = startServer();
-  const tunnel = startTunnel();
-  onShutdown(() => {
+  const tunnel = await openTunnel();
+  onShutdown(async () => {
     server.stop(true);
-    tunnel.stop();
+    await tunnel.close();
   });
 
-  const base = tunnel.hostname
-    ? `https://${tunnel.hostname}/v1`
-    : `http://127.0.0.1:${PORT}/v1`;
+  const base = tunnel.url ? `${tunnel.url}/v1` : `http://127.0.0.1:${PORT}/v1`;
+  const tunnelBadge = tunnel.url
+    ? tunnel.connected
+      ? pc.green("connected")
+      : pc.yellow("connecting…")
+    : pc.yellow("disabled");
   console.log(pc.bold(pc.cyan("shim")) + pc.dim(" proxy running"));
   console.log(`  ${pc.dim("Cursor Base URL")}  ${base}`);
   console.log(`  ${pc.dim("Cursor model")}     ${SENTINEL_MODEL}`);
   console.log(`  ${pc.dim("local")}            http://127.0.0.1:${PORT}`);
+  console.log(`  ${pc.dim("tunnel")}           ${tunnelBadge}`);
   console.log(pc.dim("\n  Run `shim` in another terminal to open the control panel."));
 }
 
@@ -98,8 +102,8 @@ Commands:
 
 Env:
   PORT                        Local HTTP port (default 8787)
-  SHIM_MAX_CONCURRENCY        Max concurrent upstream requests (default 20)
-  SHIM_DEBUG                  Set to 1 for verbose SSE/tunnel logs
+  MAX_CONCURRENCY             Max concurrent upstream requests (default 20)
+  DEBUG_LOG                       Set to 1 for verbose SSE/tunnel logs
   CLOUDFLARE_TUNNEL_TOKEN     Named Cloudflare tunnel token (required for Cursor)
   CLOUDFLARE_TUNNEL_HOSTNAME  Public hostname for the named tunnel`);
 }
