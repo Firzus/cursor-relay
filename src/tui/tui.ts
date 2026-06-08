@@ -1,8 +1,25 @@
 import pc from "picocolors";
 import { PORT, TUNNEL_HOSTNAME } from "../config.ts";
 import { allProviders, getProvider } from "../providers/registry.ts";
-import { getSelection, recentActivity, setSelection } from "../store/state.ts";
+import { cacheTotals, getSelection, recentActivity, setSelection } from "../store/state.ts";
 import type { AuthStatus, Effort, ProviderId, Selection } from "../providers/types.ts";
+
+/** Abbreviate a count with k/M suffixes above 1000 (e.g. 1234 → "1.2k"). */
+export function abbreviateCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+  return String(n);
+}
+
+/**
+ * Render the session cache-rate line body (without color). Returns the dim
+ * dash form when there is no usable input data.
+ */
+export function formatCacheRate(totals: { cached: number; input: number }): string {
+  if (totals.input <= 0) return "cache rate  —";
+  const pct = Math.round((totals.cached / totals.input) * 100);
+  return `cache rate  ${pct}%  (${abbreviateCount(totals.cached)} cached / ${abbreviateCount(totals.input)} input)`;
+}
 
 /**
  * Live control panel. Reads selection + activity from the shared store and
@@ -64,6 +81,10 @@ export async function runTui(): Promise<void> {
         lines.push(`    ${pc.dim(t)} ${r.provider}/${r.model} ${status}${tok}${dur}`);
       }
     }
+    lines.push("");
+
+    lines.push(pc.bold("  Session"));
+    lines.push(pc.dim(`    ${formatCacheRate(cacheTotals())}`));
     lines.push("");
     lines.push(pc.dim("  p provider · m model · e effort · q quit"));
 
