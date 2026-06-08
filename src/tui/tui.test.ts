@@ -1,10 +1,14 @@
 import { test, expect } from "bun:test";
 import {
   abbreviateCount,
+  authDotState,
   formatActivityTokens,
+  formatAuthMeta,
   formatCacheRate,
+  formatEndpoint,
   formatPlanUsage,
   formatResetCountdown,
+  truncateDetail,
   usageLevel,
 } from "./tui.ts";
 
@@ -124,4 +128,43 @@ test("formatCacheRate shows a dim dash when there is no usable input", () => {
 
 test("formatCacheRate treats negative input as the empty state", () => {
   expect(formatCacheRate({ cached: 0, input: -5 }, "24h")).toBe("cache rate (24h)  —");
+});
+
+// --- status bar presenters ---------------------------------------------------
+
+test("authDotState maps absence to pending, ok to ok, and not-ok to down", () => {
+  expect(authDotState(undefined)).toBe("pending");
+  expect(authDotState({ ok: true, detail: "max plan" })).toBe("ok");
+  expect(authDotState({ ok: false, detail: "credentials not found" })).toBe("down");
+});
+
+test("formatEndpoint prefers the public tunnel hostname when configured", () => {
+  expect(formatEndpoint("proxy.example.com", 8787)).toEqual({
+    url: "https://proxy.example.com/v1",
+    tunnel: "up",
+  });
+});
+
+test("formatEndpoint falls back to the local address with tunnel off", () => {
+  expect(formatEndpoint("", 8787)).toEqual({ url: "http://127.0.0.1:8787/v1", tunnel: "off" });
+});
+
+test("truncateDetail leaves short details intact and ellipsizes long ones", () => {
+  expect(truncateDetail("credentials not found")).toBe("credentials not found");
+  expect(truncateDetail("0123456789", 5)).toBe("0123…");
+  expect(truncateDetail("01234", 5)).toBe("01234"); // exactly at the limit, untouched
+});
+
+test("formatAuthMeta shows just the id when ok, unchecked, or detail-less", () => {
+  expect(formatAuthMeta("claude", { ok: true, detail: "max plan" })).toBe("claude");
+  expect(formatAuthMeta("codex", undefined)).toBe("codex");
+  expect(formatAuthMeta("claude", { ok: false, detail: "" })).toBe("claude");
+});
+
+test("formatAuthMeta surfaces a down provider's error detail inline, truncated", () => {
+  expect(formatAuthMeta("claude", { ok: false, detail: "token expired" })).toBe(
+    "claude token expired",
+  );
+  const long = "x".repeat(60);
+  expect(formatAuthMeta("claude", { ok: false, detail: long })).toBe(`claude ${truncateDetail(long)}`);
 });

@@ -112,6 +112,57 @@ export function formatCacheRate(totals: { cached: number; input: number }, perio
   return `cache rate (${period})  ${pct}%  (${abbreviateCount(totals.cached)} cached / ${abbreviateCount(totals.input)} input)`;
 }
 
+// --- status bar presenters (pure) --------------------------------------------
+
+/** Semantic state of a provider auth dot, mapped to colour by the caller. */
+export type AuthDotState = "ok" | "down" | "pending";
+
+/**
+ * Map an auth status (or its absence, before the first check) to a dot state.
+ * `pending` is the dim "not checked yet" state; `down` carries an error the
+ * caller surfaces inline. Pure.
+ */
+export function authDotState(auth: AuthStatus | undefined): AuthDotState {
+  if (!auth) return "pending";
+  return auth.ok ? "ok" : "down";
+}
+
+/** Endpoint URL + tunnel state for the meta strip. `up` when a tunnel hostname is configured. */
+export interface EndpointInfo {
+  url: string;
+  tunnel: "up" | "off";
+}
+
+/**
+ * Where Cursor should point, plus whether a tunnel fronts it. The TUI only
+ * knows the configured hostname (it does not run the tunnel), so `up` means
+ * "a public hostname is configured", `off` means local-only. Pure.
+ */
+export function formatEndpoint(tunnelHostname: string, port: number): EndpointInfo {
+  if (tunnelHostname) return { url: `https://${tunnelHostname}/v1`, tunnel: "up" };
+  return { url: `http://127.0.0.1:${port}/v1`, tunnel: "off" };
+}
+
+/**
+ * Truncate an inline detail (e.g. a down provider's auth error) to `max`
+ * characters, appending an ellipsis when cut, so a long message cannot blow out
+ * the meta strip. Pure.
+ */
+export function truncateDetail(detail: string, max = 48): string {
+  if (detail.length <= max) return detail;
+  return `${detail.slice(0, max - 1)}…`;
+}
+
+/**
+ * The inline label for one provider in the meta strip: just the id when the
+ * provider is ok or unchecked, or `id detail` (truncated) when it is down — so
+ * an auth failure is diagnosable without leaving the panel. Pure.
+ */
+export function formatAuthMeta(id: string, auth: AuthStatus | undefined): string {
+  if (auth && !auth.ok && auth.detail) return `${id} ${truncateDetail(auth.detail)}`;
+  return id;
+}
+
 // --- OpenTUI mount -----------------------------------------------------------
 //
 // The mount layer below is intentionally thin and untested: it builds the
@@ -237,24 +288,30 @@ export async function runTui(): Promise<void> {
   const render = (): void => {
     const now = Date.now();
 
-    // tier 1: active selection (control anchor)
+    // tier 1: active selection, highlighted as the control anchor (bold accent
+    // values, dim labels) so the operator always knows which backend serves traffic.
     selText.content = new StyledText([
-      bold(cyan("shim ")),
-      dim("· provider "),
-      green(sel.provider),
+      bold(cyan("shim")),
+      dim("  provider "),
+      bold(cyan(sel.provider)),
       dim("  model "),
-      green(sel.model),
+      bold(cyan(sel.model)),
       dim("  effort "),
-      green(sel.effort),
+      bold(cyan(sel.effort)),
     ]);
 
-    // tier 2: endpoint + provider auth (refined into a richer meta strip in slice 2)
-    const endpoint = TUNNEL_HOSTNAME ? `https://${TUNNEL_HOSTNAME}/v1` : `http://127.0.0.1:${PORT}/v1 (no tunnel)`;
-    const metaChunks: TextChunk[] = [dim("endpoint "), TUNNEL_HOSTNAME ? dim(endpoint) : yellow(endpoint)];
+    // tier 2: dim meta strip — endpoint, tunnel state, and per-provider auth
+    // dots; a down provider surfaces its error detail inline.
+    const endpoint = formatEndpoint(TUNNEL_HOSTNAME, PORT);
+    const metaChunks: TextChunk[] = [
+      dim(`${endpoint.url}  `),
+      endpoint.tunnel === "up" ? green("tunnel up") : yellow("no tunnel"),
+    ];
     for (const p of providers) {
       const a = authCache.get(p.id);
-      const dot = a ? (a.ok ? green("●") : red("●")) : dim("…");
-      metaChunks.push(dim("  "), dot, dim(` ${p.id}`));
+      const state = authDotState(a);
+      const dot = state === "ok" ? green("●") : state === "down" ? red("●") : dim("●");
+      metaChunks.push(SPACE, SPACE, dot, dim(` ${formatAuthMeta(p.id, a)}`));
     }
     metaText.content = new StyledText(metaChunks);
 
