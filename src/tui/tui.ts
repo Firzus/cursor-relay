@@ -21,11 +21,13 @@ import {
   getPlanUsage,
   getSelection,
   nextPeriod,
+  pendingCount,
   type Period,
   periodSince,
   type PlanWindow,
   recentActivity,
   setSelection,
+  windowedCounters,
 } from "../store/state.ts";
 import type { AuthStatus, Effort, ProviderId, Selection } from "../providers/types.ts";
 
@@ -110,6 +112,15 @@ export function formatCacheRate(totals: { cached: number; input: number }, perio
   if (totals.input <= 0) return `cache rate (${period})  —`;
   const pct = Math.round((totals.cached / totals.input) * 100);
   return `cache rate (${period})  ${pct}%  (${abbreviateCount(totals.cached)} cached / ${abbreviateCount(totals.input)} input)`;
+}
+
+/**
+ * The counters line for the metrics panel: requests + errors over the selected
+ * window, plus the live in-flight count (point-in-time, not windowed). Counts
+ * are abbreviated like the rest of the panel. Pure.
+ */
+export function formatCounters(c: { requests: number; errors: number; inFlight: number }): string {
+  return `requests ${abbreviateCount(c.requests)}  ·  errors ${abbreviateCount(c.errors)}  ·  in-flight ${abbreviateCount(c.inFlight)}`;
 }
 
 // --- status bar presenters (pure) --------------------------------------------
@@ -388,9 +399,19 @@ export async function runTui(): Promise<void> {
     paddingLeft: 1,
     paddingRight: 1,
   });
-  const metricsText = new TextRenderable(renderer, { id: "metricsText", content: "" });
+  // Two sub-areas side by side: plan usage on the left (slice 6), windowed cache
+  // rate + counters on the right; the keybind hints sit on the last line.
+  const metricsRow = new BoxRenderable(renderer, { id: "metricsRow", flexDirection: "row" });
+  const metricsLeft = new BoxRenderable(renderer, { id: "metricsLeft", flexGrow: 1 });
+  const metricsRight = new BoxRenderable(renderer, { id: "metricsRight", flexGrow: 1 });
+  const planText = new TextRenderable(renderer, { id: "plan", content: "" });
+  const rightText = new TextRenderable(renderer, { id: "right", content: "" });
+  metricsLeft.add(planText);
+  metricsRight.add(rightText);
+  metricsRow.add(metricsLeft);
+  metricsRow.add(metricsRight);
   const hintsText = new TextRenderable(renderer, { id: "hints", content: "" });
-  metrics.add(metricsText);
+  metrics.add(metricsRow);
   metrics.add(hintsText);
 
   app.add(statusBar);
@@ -449,22 +470,27 @@ export async function runTui(): Promise<void> {
     cachedRows = recentActivity(streamInner().h);
     renderStream(now);
 
-    // bottom: cache rate + plan usage
-    const lines: StyledText[] = [
-      new StyledText([dim(formatCacheRate(cacheTotals(periodSince(period, now)), period))]),
-    ];
+    // bottom-left: plan usage (scoped to the active provider in slice 6)
     const usage = getPlanUsage("claude");
     if (!usage) {
-      lines.push(new StyledText([dim("plan usage (claude)  (no data yet)")]));
+      planText.content = new StyledText([dim("plan usage (claude)  (no data yet)")]);
     } else {
       const bar = (label: string, w: PlanWindow): StyledText => {
         const lvl = usageLevel(w.utilization);
         const color = lvl === "crit" ? red : lvl === "warn" ? yellow : green;
         return new StyledText([color(formatPlanUsage(label, w, now))]);
       };
-      lines.push(bar("5h", usage.fiveHour), bar("weekly", usage.weekly));
+      planText.content = joinLines([bar("5h", usage.fiveHour), bar("weekly", usage.weekly)]);
     }
-    metricsText.content = joinLines(lines);
+
+    // bottom-right: windowed cache rate + counters. The `w` period scopes the
+    // cache rate AND the request/error counters together; in-flight is live.
+    const since = periodSince(period, now);
+    const counters = { ...windowedCounters(since), inFlight: pendingCount() };
+    rightText.content = joinLines([
+      new StyledText([dim(formatCacheRate(cacheTotals(since), period))]),
+      new StyledText([dim(formatCounters(counters))]),
+    ]);
 
     hintsText.content = new StyledText([dim("p provider · m model · e effort · w window · q quit")]);
 

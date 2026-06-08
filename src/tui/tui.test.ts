@@ -8,6 +8,7 @@ import {
   formatActivityTokens,
   formatAuthMeta,
   formatCacheRate,
+  formatCounters,
   formatElapsed,
   formatEndpoint,
   formatPlanUsage,
@@ -133,6 +134,18 @@ test("formatCacheRate shows a dim dash when there is no usable input", () => {
 
 test("formatCacheRate treats negative input as the empty state", () => {
   expect(formatCacheRate({ cached: 0, input: -5 }, "24h")).toBe("cache rate (24h)  —");
+});
+
+test("formatCounters renders requests, errors, and the live in-flight count", () => {
+  expect(formatCounters({ requests: 128, errors: 3, inFlight: 2 })).toBe(
+    "requests 128  ·  errors 3  ·  in-flight 2",
+  );
+});
+
+test("formatCounters abbreviates large counts like the rest of the panel", () => {
+  expect(formatCounters({ requests: 12_000, errors: 0, inFlight: 0 })).toBe(
+    "requests 12k  ·  errors 0  ·  in-flight 0",
+  );
 });
 
 // --- status bar presenters ---------------------------------------------------

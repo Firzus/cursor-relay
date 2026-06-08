@@ -150,6 +150,38 @@ export function cacheTotals(since = 0, db: Database = getDb()): { cached: number
   return { cached: row.cached, input: row.input };
 }
 
+/**
+ * Request + error counts over a bounded window — rows with `ts >= since`.
+ * `requests` is every row in the window (all statuses); `errors` is the subset
+ * with `status = 'error'`. Shares the `w` period with the cache rate, so all
+ * windowed metrics read one consistent window. Pass `since = 0` for the whole
+ * table. `db` is injectable for tests against a temporary database.
+ */
+export function windowedCounters(
+  since = 0,
+  db: Database = getDb(),
+): { requests: number; errors: number } {
+  const row = db
+    .query(
+      `SELECT COUNT(*) AS requests,
+              COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS errors
+         FROM activity WHERE ts >= $since`,
+    )
+    .get({ $since: since }) as { requests: number; errors: number };
+  return { requests: row.requests, errors: row.errors };
+}
+
+/**
+ * Point-in-time count of in-flight (`pending`) requests — current load, not a
+ * windowed metric, so it ignores any period. `db` is injectable for tests.
+ */
+export function pendingCount(db: Database = getDb()): number {
+  const row = db
+    .query("SELECT COUNT(*) AS n FROM activity WHERE status = 'pending'")
+    .get() as { n: number };
+  return row.n;
+}
+
 // --- plan usage (subscription consumption, from Anthropic headers) -----------
 
 /** One rate-limit window: normalized utilization fraction + reset + status. */

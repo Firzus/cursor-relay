@@ -5,12 +5,14 @@ import {
   DEFAULT_PERIOD,
   getPlanUsage,
   nextPeriod,
+  pendingCount,
   type Period,
   type PlanUsageRecord,
   type PlanUsageSnapshot,
   periodSince,
   savePlanUsage,
   shouldPersistUsage,
+  windowedCounters,
 } from "./state.ts";
 
 const HOUR = 60 * 60 * 1000;
@@ -94,6 +96,56 @@ test("cacheTotals treats NULL token counts as 0 and is empty on an empty window"
   expect(cacheTotals(periodSince("24h", now), db)).toEqual({ cached: 50, input: 100 });
   // Window with no rows: COALESCE keeps the shape as zeros, not NULL.
   expect(cacheTotals(now + DAY, db)).toEqual({ cached: 0, input: 0 });
+});
+
+/** Build a throwaway activity table with the columns the counters reads need. */
+function seedActivity(rows: Array<{ ts: number; status: string }>): Database {
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE activity (
+      id     INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts     INTEGER NOT NULL,
+      status TEXT NOT NULL
+    );
+  `);
+  const insert = db.query("INSERT INTO activity (ts, status) VALUES ($ts, $status)");
+  for (const r of rows) insert.run({ $ts: r.ts, $status: r.status });
+  return db;
+}
+
+test("windowedCounters counts requests and errors only inside the window", () => {
+  const now = 1_000_000_000_000;
+  const db = seedActivity([
+    { ts: now - 2 * HOUR, status: "ok" }, // inside
+    { ts: now - 3 * HOUR, status: "error" }, // inside
+    { ts: now - 4 * HOUR, status: "pending" }, // inside
+    { ts: now - 10 * HOUR, status: "error" }, // outside 5h
+  ]);
+  expect(windowedCounters(periodSince("5h", now), db)).toEqual({ requests: 3, errors: 1 });
+  expect(windowedCounters(periodSince("all", now), db)).toEqual({ requests: 4, errors: 2 });
+});
+
+test("windowedCounters is zeros on an empty window", () => {
+  const now = 1_000_000_000_000;
+  const db = seedActivity([{ ts: now - 2 * HOUR, status: "ok" }]);
+  expect(windowedCounters(now + DAY, db)).toEqual({ requests: 0, errors: 0 });
+});
+
+test("pendingCount counts in-flight rows regardless of the window", () => {
+  const now = 1_000_000_000_000;
+  const db = seedActivity([
+    { ts: now - 1 * HOUR, status: "pending" },
+    { ts: now - 20 * DAY, status: "pending" }, // old, but still in-flight (point-in-time)
+    { ts: now - 1 * HOUR, status: "ok" },
+    { ts: now - 1 * HOUR, status: "error" },
+  ]);
+  expect(pendingCount(db)).toBe(2);
+});
+
+test("pendingCount is 0 when nothing is in-flight", () => {
+  const now = 1_000_000_000_000;
+  const db = seedActivity([{ ts: now - 1 * HOUR, status: "ok" }]);
+  expect(pendingCount(db)).toBe(0);
 });
 
 // --- plan usage --------------------------------------------------------------
