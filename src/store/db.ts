@@ -35,6 +35,16 @@ export function getDb(): Database {
       note              TEXT
     );
     CREATE INDEX IF NOT EXISTS activity_ts ON activity (ts DESC);
+    CREATE TABLE IF NOT EXISTS plan_usage (
+      provider           TEXT PRIMARY KEY,
+      captured_at        INTEGER NOT NULL,
+      fiveh_utilization  REAL NOT NULL,
+      fiveh_reset        INTEGER NOT NULL,
+      fiveh_status       TEXT NOT NULL,
+      weekly_utilization REAL NOT NULL,
+      weekly_reset       INTEGER NOT NULL,
+      weekly_status      TEXT NOT NULL
+    );
   `);
   migrateActivityColumns(d);
   db = d;

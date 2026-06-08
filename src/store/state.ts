@@ -1,5 +1,36 @@
+import type { Database } from "bun:sqlite";
 import { getDb } from "./db.ts";
 import type { Effort, ProviderId, Selection } from "../providers/types.ts";
+
+/** Selectable cache-rate windows, ordered for cycling in the TUI. */
+export const PERIODS = ["5h", "24h", "7d", "30d", "all"] as const;
+export type Period = (typeof PERIODS)[number];
+
+/** Cache rate windows to 24h by default — recent enough to read the live signal. */
+export const DEFAULT_PERIOD: Period = "24h";
+
+const PERIOD_MS: Record<Exclude<Period, "all">, number> = {
+  "5h": 5 * 60 * 60 * 1000,
+  "24h": 24 * 60 * 60 * 1000,
+  "7d": 7 * 24 * 60 * 60 * 1000,
+  "30d": 30 * 24 * 60 * 60 * 1000,
+};
+
+/**
+ * Epoch (ms) lower bound for a period window, given the current time. `all`
+ * maps to 0 — no bound, the whole table. Pure: `now` is injected so callers
+ * (and tests) control the reference point.
+ */
+export function periodSince(period: Period, now: number): number {
+  if (period === "all") return 0;
+  return now - PERIOD_MS[period];
+}
+
+/** Next period in the cycle order, wrapping `all` back to `5h`. */
+export function nextPeriod(period: Period): Period {
+  const i = PERIODS.indexOf(period);
+  return PERIODS[(i + 1) % PERIODS.length] as Period;
+}
 
 /** Used the first time the store is opened with no selection yet. */
 export const DEFAULT_SELECTION: Selection = {
@@ -102,17 +133,129 @@ export function recentActivity(limit = 50): ActivityRow[] {
 }
 
 /**
- * Token-weighted cache totals across the entire activity table (all statuses).
- * NULL `cached_tokens` (pre-migration rows) count as 0. The session cache rate
- * is `cached / input`.
+ * Token-weighted cache totals over a bounded window — rows with `ts >= since`
+ * (all statuses). NULL `cached_tokens` (pre-migration rows) count as 0. The
+ * cache rate is `cached / input`. Windowing keeps cold pre-cache history out of
+ * the denominator; pass `since = 0` for the whole table. `db` is injectable for
+ * tests against a temporary database.
  */
-export function cacheTotals(): { cached: number; input: number } {
-  const row = getDb()
+export function cacheTotals(since = 0, db: Database = getDb()): { cached: number; input: number } {
+  const row = db
     .query(
       `SELECT COALESCE(SUM(cached_tokens), 0) AS cached,
               COALESCE(SUM(prompt_tokens), 0) AS input
-         FROM activity`,
+         FROM activity WHERE ts >= $since`,
     )
-    .get() as { cached: number; input: number };
+    .get({ $since: since }) as { cached: number; input: number };
   return { cached: row.cached, input: row.input };
+}
+
+// --- plan usage (subscription consumption, from Anthropic headers) -----------
+
+/** One rate-limit window: normalized utilization fraction + reset + status. */
+export interface PlanWindow {
+  /** 0–1 fraction (Anthropic's percent-as-fraction; e.g. 0.71 = 71%). */
+  utilization: number;
+  /** Epoch ms when this window resets. */
+  resetAt: number;
+  /** Anthropic status enum, e.g. "allowed". */
+  status: string;
+}
+
+/** A plan-usage reading: the 5h + weekly windows captured from one response. */
+export interface PlanUsageSnapshot {
+  fiveHour: PlanWindow;
+  weekly: PlanWindow;
+}
+
+/** A persisted snapshot, carrying when it was captured. */
+export interface PlanUsageRecord extends PlanUsageSnapshot {
+  /** Epoch ms of capture. */
+  capturedAt: number;
+}
+
+/** Persist no more than one row per provider per this interval (unless status changes). */
+export const USAGE_THROTTLE_MS = 5000;
+
+/**
+ * Throttle decision for plan-usage capture. Pure. Persist when there is no
+ * prior row, when either window's status changed (a state transition is always
+ * worth recording), or when the last persist is at least `USAGE_THROTTLE_MS`
+ * old. Otherwise skip — the headers arrive on every response and barely move.
+ */
+export function shouldPersistUsage(
+  prev: PlanUsageRecord | null,
+  next: PlanUsageSnapshot,
+  now: number,
+): boolean {
+  if (!prev) return true;
+  if (prev.fiveHour.status !== next.fiveHour.status) return true;
+  if (prev.weekly.status !== next.weekly.status) return true;
+  return now - prev.capturedAt >= USAGE_THROTTLE_MS;
+}
+
+interface PlanUsageDbRow {
+  captured_at: number;
+  fiveh_utilization: number;
+  fiveh_reset: number;
+  fiveh_status: string;
+  weekly_utilization: number;
+  weekly_reset: number;
+  weekly_status: string;
+}
+
+/** Read the latest plan-usage snapshot for a provider, or null if none stored. */
+export function getPlanUsage(provider: string, db: Database = getDb()): PlanUsageRecord | null {
+  const row = db
+    .query(
+      `SELECT captured_at, fiveh_utilization, fiveh_reset, fiveh_status,
+              weekly_utilization, weekly_reset, weekly_status
+         FROM plan_usage WHERE provider = $p`,
+    )
+    .get({ $p: provider }) as PlanUsageDbRow | null;
+  if (!row) return null;
+  return {
+    capturedAt: row.captured_at,
+    fiveHour: { utilization: row.fiveh_utilization, resetAt: row.fiveh_reset, status: row.fiveh_status },
+    weekly: { utilization: row.weekly_utilization, resetAt: row.weekly_reset, status: row.weekly_status },
+  };
+}
+
+/** Upsert the single plan-usage row for a provider. */
+export function savePlanUsage(
+  provider: string,
+  snap: PlanUsageSnapshot,
+  now: number,
+  db: Database = getDb(),
+): void {
+  db.query(
+    `INSERT INTO plan_usage (
+       provider, captured_at,
+       fiveh_utilization, fiveh_reset, fiveh_status,
+       weekly_utilization, weekly_reset, weekly_status
+     ) VALUES ($p, $ts, $fu, $fr, $fs, $wu, $wr, $ws)
+     ON CONFLICT(provider) DO UPDATE SET
+       captured_at = $ts,
+       fiveh_utilization = $fu, fiveh_reset = $fr, fiveh_status = $fs,
+       weekly_utilization = $wu, weekly_reset = $wr, weekly_status = $ws`,
+  ).run({
+    $p: provider,
+    $ts: now,
+    $fu: snap.fiveHour.utilization,
+    $fr: snap.fiveHour.resetAt,
+    $fs: snap.fiveHour.status,
+    $wu: snap.weekly.utilization,
+    $wr: snap.weekly.resetAt,
+    $ws: snap.weekly.status,
+  });
+}
+
+/**
+ * Capture a plan-usage snapshot, throttled. Reads the prior row, applies
+ * `shouldPersistUsage`, and upserts only when warranted. Impure orchestrator;
+ * the decision and persistence pieces are independently testable above.
+ */
+export function recordPlanUsage(provider: string, snap: PlanUsageSnapshot, now = Date.now()): void {
+  const prev = getPlanUsage(provider);
+  if (shouldPersistUsage(prev, snap, now)) savePlanUsage(provider, snap, now);
 }
