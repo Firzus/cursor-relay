@@ -98,6 +98,8 @@ export function buildAnthropicRequest(
   // system prompt). The identity block always exists, so this is always safe.
   system[system.length - 1]!.cache_control = CACHE_CONTROL;
 
+  markConversationBreakpoints(messages);
+
   const maxTokens = typeof body.max_tokens === "number" ? body.max_tokens : DEFAULT_MAX_TOKENS;
   const req: AnthropicBody = {
     model: opts.model,
@@ -109,6 +111,40 @@ export function buildAnthropicRequest(
   const tools = mapTools(body.tools);
   if (tools) req.tools = tools;
   return req;
+}
+
+/**
+ * Conversation breakpoints: cache growing history on top of the stable
+ * system/tools prefix, spending the remaining 2 of Anthropic's 4-breakpoint
+ * budget. Anchors live on **user** messages only — the stable turn boundaries:
+ *
+ * - **fixed anchor** on the first user message (caches the immutable head of a
+ *   long conversation, the savings that compound most), and
+ * - **rolling anchor** on the second-to-last user message (the position next
+ *   turn's prefix still matches exactly, guaranteeing a cache read).
+ *
+ * The **last** message is never marked: it is new every turn, so a marker there
+ * is a cache write with no matching read (reads already refresh the TTL). When
+ * the only user message is also the last message, both anchors fall away.
+ * Placement is defensive — at most 2 markers, only on blocks that exist. See
+ * ADR-0001.
+ */
+function markConversationBreakpoints(messages: Array<{ role: string; content: unknown }>): void {
+  const userIdx = messages.flatMap((m, i) => (m.role === "user" ? [i] : []));
+  const anchors = new Set<number>();
+  if (userIdx.length >= 1) anchors.add(userIdx[0]!); // fixed anchor
+  if (userIdx.length >= 2) anchors.add(userIdx[userIdx.length - 2]!); // rolling anchor
+  anchors.delete(messages.length - 1); // never mark the new last message
+  for (const i of anchors) markLastBlock(messages[i]!);
+}
+
+/** Attach the cache breakpoint to a message's last content block, if any. */
+function markLastBlock(message: { role: string; content: unknown }): void {
+  if (!Array.isArray(message.content) || message.content.length === 0) return;
+  const last = message.content[message.content.length - 1];
+  if (last && typeof last === "object") {
+    (last as { cache_control?: typeof CACHE_CONTROL }).cache_control = CACHE_CONTROL;
+  }
 }
 
 /**

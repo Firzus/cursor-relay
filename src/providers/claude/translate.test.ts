@@ -174,6 +174,100 @@ test("batches consecutive tool messages into one Anthropic user turn of tool_res
   });
 });
 
+// --- conversation breakpoints (issue #6) -----------------------------------
+function cacheMarked(messages: Array<{ role: string; content: unknown }>): number[] {
+  return messages.flatMap((m, i) => {
+    const content = m.content;
+    if (!Array.isArray(content) || content.length === 0) return [];
+    const last = content[content.length - 1] as { cache_control?: unknown };
+    return last?.cache_control ? [i] : [];
+  });
+}
+
+test("marks no conversation breakpoint for a single user message (it is the new last message)", () => {
+  const body = { messages: [{ role: "user", content: "hi" }] };
+  const out = buildAnthropicRequest(body, { model: "claude-sonnet-4-6", effort: "medium" });
+  expect(cacheMarked(out.messages)).toEqual([]);
+});
+
+test("marks no conversation breakpoint when there are no user messages", () => {
+  const body = { messages: [{ role: "assistant", content: "preface" }] };
+  const out = buildAnthropicRequest(body, { model: "claude-sonnet-4-6", effort: "medium" });
+  expect(cacheMarked(out.messages)).toEqual([]);
+});
+
+test("marks the fixed anchor (first user message) when a later turn follows it", () => {
+  const body = {
+    messages: [
+      { role: "user", content: "first" },
+      { role: "assistant", content: "answer" },
+      { role: "user", content: "second" }, // new last message -> never marked
+    ],
+  };
+  const out = buildAnthropicRequest(body, { model: "claude-sonnet-4-6", effort: "medium" });
+  // Fixed and rolling anchor both resolve to the first user message; last is untouched.
+  expect(cacheMarked(out.messages)).toEqual([0]);
+  expect((out.messages[0]!.content as Array<{ cache_control?: unknown }>)[0]!.cache_control).toEqual(CACHE_CONTROL);
+  expect((out.messages[2]!.content as Array<{ cache_control?: unknown }>)[0]!.cache_control).toBeUndefined();
+});
+
+test("marks distinct fixed and rolling anchors across three user turns", () => {
+  const body = {
+    messages: [
+      { role: "user", content: "u1" }, // fixed anchor
+      { role: "assistant", content: "a1" },
+      { role: "user", content: "u2" }, // rolling anchor (second-to-last user)
+      { role: "assistant", content: "a2" },
+      { role: "user", content: "u3" }, // new last message -> never marked
+    ],
+  };
+  const out = buildAnthropicRequest(body, { model: "claude-sonnet-4-6", effort: "medium" });
+  expect(cacheMarked(out.messages)).toEqual([0, 2]);
+  expect(cacheMarked(out.messages).length).toBeLessThanOrEqual(2); // 2 of the 4-breakpoint budget
+});
+
+test("never exceeds 4 cache breakpoints across system + tools + conversation", () => {
+  const tool = (name: string) => ({ type: "function", function: { name, description: "", parameters: {} } });
+  const body = {
+    tools: [tool("Read"), tool("Write")],
+    messages: [
+      { role: "user", content: "u1" },
+      { role: "assistant", content: "a1" },
+      { role: "user", content: "u2" },
+      { role: "assistant", content: "a2" },
+      { role: "user", content: "u3" },
+    ],
+  };
+  const out = buildAnthropicRequest(body, { model: "claude-sonnet-4-6", effort: "medium" });
+  const systemMarks = out.system.filter((b) => b.cache_control).length;
+  const toolMarks = (out.tools as Array<{ cache_control?: unknown }>).filter((t) => t.cache_control).length;
+  const convMarks = cacheMarked(out.messages).length;
+  expect(systemMarks).toBe(1);
+  expect(toolMarks).toBe(1);
+  expect(convMarks).toBe(2);
+  expect(systemMarks + toolMarks + convMarks).toBe(4);
+});
+
+test("anchors a tool_result user turn on its last block (defensive, no missing-block reference)", () => {
+  const body = {
+    messages: [
+      { role: "user", content: "go" }, // fixed anchor
+      {
+        role: "assistant",
+        content: [],
+        tool_calls: [{ id: "call_a", type: "function", function: { name: "Read", arguments: "{}" } }],
+      },
+      { role: "tool", tool_call_id: "call_a", content: "resA" }, // batched into a user turn (rolling anchor)
+      { role: "user", content: "again" }, // new last message -> never marked
+    ],
+  };
+  const out = buildAnthropicRequest(body, { model: "claude-sonnet-4-6", effort: "medium" });
+  // user("go"), assistant(tool_use), user(tool_result), user("again")
+  expect(cacheMarked(out.messages)).toEqual([0, 2]);
+  const toolResultTurn = out.messages[2]!.content as Array<{ type: string; cache_control?: unknown }>;
+  expect(toolResultTurn[toolResultTurn.length - 1]!.cache_control).toEqual(CACHE_CONTROL);
+});
+
 test("translates Anthropic text_delta events into OpenAI content chunks ending with [DONE]", async () => {
   const upstream = anthropicSSE([
     { event: "message_start", data: { type: "message_start", message: { id: "msg_1", usage: { input_tokens: 10, output_tokens: 1 } } } },
