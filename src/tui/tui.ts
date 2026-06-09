@@ -389,13 +389,15 @@ export async function runTui(): Promise<void> {
   const authCache = new Map<ProviderId, AuthStatus>();
 
   const refreshAuth = async (): Promise<void> => {
-    for (const p of providers) {
-      try {
-        authCache.set(p.id, await p.authStatus());
-      } catch (err) {
-        authCache.set(p.id, { ok: false, detail: err instanceof Error ? err.message : String(err) });
-      }
-    }
+    await Promise.all(
+      providers.map(async (p) => {
+        try {
+          authCache.set(p.id, await p.authStatus());
+        } catch (err) {
+          authCache.set(p.id, { ok: false, detail: err instanceof Error ? err.message : String(err) });
+        }
+      }),
+    );
   };
 
   const renderer = await createCliRenderer({ exitOnCtrlC: false, targetFps: 30 });
@@ -507,6 +509,11 @@ export async function runTui(): Promise<void> {
     metricsLeft.width = collapsed ? 0 : "auto";
   };
 
+  // Static content: the endpoint is fixed at startup (config is immutable at
+  // runtime) and the hints never change, so neither is rebuilt per render.
+  const endpoint = formatEndpoint(TUNNEL_HOSTNAME, PORT);
+  hintsText.content = new StyledText([dim("p provider · m model · e effort · w window · q quit")]);
+
   // --- render: data → props ------------------------------------------------
   const render = (): void => {
     const now = Date.now();
@@ -537,7 +544,6 @@ export async function runTui(): Promise<void> {
 
     // tier 2: dim meta strip — endpoint, tunnel state, and per-provider auth
     // dots; a down provider surfaces its error detail inline.
-    const endpoint = formatEndpoint(TUNNEL_HOSTNAME, PORT);
     const metaChunks: TextChunk[] = [
       dim(`${endpoint.url}  `),
       endpoint.tunnel === "up" ? green("tunnel up") : yellow("no tunnel"),
@@ -591,8 +597,6 @@ export async function runTui(): Promise<void> {
       new StyledText([dim(formatCacheRate(cacheTotalsRecent(sample), sample))]),
       new StyledText([dim(formatCounters(counters, period))]),
     ]);
-
-    hintsText.content = new StyledText([dim("p provider · m model · e effort · w window · q quit")]);
 
     renderer.requestRender();
   };
