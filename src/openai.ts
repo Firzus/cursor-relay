@@ -33,6 +33,18 @@ export function sse(data: unknown): string {
   return `data: ${JSON.stringify(data)}\n\n`;
 }
 
+/** Flatten OpenAI chat message content (string or content-part array) to text. */
+export function extractText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
+      .filter(Boolean)
+      .join("");
+  }
+  return "";
+}
+
 export const SSE_DONE = "data: [DONE]\n\n";
 
 export const SSE_HEADERS: Record<string, string> = {

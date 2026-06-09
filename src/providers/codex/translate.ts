@@ -1,5 +1,6 @@
 import type { Effort } from "../types.ts";
-import { chatChunk, newCompletionId, sse, SSE_DONE } from "../../openai.ts";
+import { chatChunk, extractText, newCompletionId, sse, SSE_DONE } from "../../openai.ts";
+import { parseSSEEvent, sseBlocks } from "../../sse.ts";
 
 /**
  * OpenAI Chat Completions <-> OpenAI Responses translation for the Codex
@@ -103,17 +104,6 @@ function mapTools(tools: unknown): unknown[] | undefined {
     });
   }
   return out.length ? out : undefined;
-}
-
-function extractText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
-      .filter(Boolean)
-      .join("");
-  }
-  return "";
 }
 
 // --- streaming: Responses SSE -> OpenAI chat.completion.chunk ---------------
@@ -272,42 +262,13 @@ interface ResponsesEvent {
 }
 
 async function* parseResponsesSSE(stream: ReadableStream<Uint8Array>): AsyncGenerator<ResponsesEvent> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let idx: number;
-      while ((idx = buffer.indexOf("\n\n")) !== -1) {
-        const block = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        const ev = parseBlock(block);
-        if (ev) yield ev;
-      }
+  for await (const block of sseBlocks(stream)) {
+    const raw = parseSSEEvent(block);
+    if (!raw || raw.data === "[DONE]") continue;
+    try {
+      yield { event: raw.event, data: JSON.parse(raw.data) };
+    } catch {
+      yield { event: raw.event, data: raw.data };
     }
-    const tail = parseBlock(buffer);
-    if (tail) yield tail;
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-function parseBlock(block: string): ResponsesEvent | null {
-  let eventName = "message";
-  const dataLines: string[] = [];
-  for (const line of block.split(/\r?\n/)) {
-    if (line.startsWith("event:")) eventName = line.slice(6).trim();
-    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
-  }
-  if (dataLines.length === 0) return null;
-  const dataStr = dataLines.join("\n");
-  if (dataStr === "[DONE]") return null;
-  try {
-    return { event: eventName, data: JSON.parse(dataStr) };
-  } catch {
-    return { event: eventName, data: dataStr };
   }
 }

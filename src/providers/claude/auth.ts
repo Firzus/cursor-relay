@@ -6,6 +6,7 @@ import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
 import { dirname } from "node:path";
 import { CLAUDE_CREDENTIALS } from "../../paths.ts";
 import type { AuthStatus } from "../types.ts";
+import { tokenNeedsRefresh } from "../shared.ts";
 
 export interface ClaudeClaims {
   accessToken: string;
@@ -18,7 +19,6 @@ export interface ClaudeClaims {
 
 const TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const REFRESH_MARGIN_MS = 60_000;
 
 /** The OAuth refresh request shape Claude Code uses (JSON body, public client id). */
 export function buildRefreshRequest(refreshToken: string): {
@@ -39,7 +39,7 @@ export function buildRefreshRequest(refreshToken: string): {
 
 /** True when the token is expired or within the refresh margin of expiring. */
 export function needsRefresh(claims: ClaudeClaims, now: number): boolean {
-  return now >= claims.expiresAt - REFRESH_MARGIN_MS;
+  return tokenNeedsRefresh(claims.expiresAt, now);
 }
 
 export class ClaudeAuthError extends Error {
