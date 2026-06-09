@@ -10,12 +10,13 @@ import { recordPlanUsage } from "../../store/state.ts";
 /**
  * Claude provider — Anthropic Messages API via Claude Code OAuth.
  *
- * Model set: opus-4-8 + sonnet-4-6 (haiku dropped — it rejects adaptive/effort).
- * Thinking: thinking:{type:"adaptive"} + output_config.effort for both models.
+ * Model set: fable-5 + opus-4-8 + sonnet-4-6 (haiku dropped — it rejects adaptive/effort).
+ * Thinking: thinking:{type:"adaptive"} + output_config.effort for all models.
  * The translator always injects the mandatory Claude Code identity system block.
  */
 
 const MODELS: readonly ProviderModel[] = [
+  { id: "claude-fable-5", label: "Fable 5", efforts: ["low", "medium", "high", "extra"] },
   { id: "claude-opus-4-8", label: "Opus 4.8", efforts: ["low", "medium", "high", "extra"] },
   { id: "claude-sonnet-4-6", label: "Sonnet 4.6", efforts: ["low", "medium", "high", "extra"] },
 ];

@@ -69,7 +69,9 @@ test("maps effort to adaptive thinking + output_config.effort, clamping 'extra' 
   expect(sonnetHigh.thinking).toEqual({ type: "adaptive", display: "summarized" });
   expect(sonnetHigh.output_config).toEqual({ effort: "high" });
 
-  // 'extra' clamps differently: opus accepts xhigh, sonnet rejects xhigh but accepts max.
+  // 'extra' clamps differently: fable/opus accept xhigh, sonnet rejects xhigh but accepts max.
+  const fableExtra = buildAnthropicRequest(body, { model: "claude-fable-5", effort: "extra" });
+  expect(fableExtra.output_config).toEqual({ effort: "xhigh" });
   const opusExtra = buildAnthropicRequest(body, { model: "claude-opus-4-8", effort: "extra" });
   expect(opusExtra.output_config).toEqual({ effort: "xhigh" });
   const sonnetExtra = buildAnthropicRequest(body, { model: "claude-sonnet-4-6", effort: "extra" });

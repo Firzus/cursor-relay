@@ -174,7 +174,7 @@ function mapTools(tools: unknown): Array<Record<string, unknown>> | undefined {
   return out;
 }
 
-/** Both models use adaptive thinking; only the effort vocabulary differs. */
+/** All models use adaptive thinking; only the effort vocabulary differs. */
 export function mapThinking(
   model: string,
   effort: Effort,
@@ -187,6 +187,7 @@ export function mapThinking(
 
 function mapEffort(model: string, effort: Effort): string {
   if (effort !== "extra") return effort; // low/medium/high pass through unchanged
+  if (model.includes("fable")) return "xhigh"; // fable supports xhigh and max; xhigh is the agentic sweet spot
   if (model.includes("opus")) return "xhigh"; // opus-only top tier
   if (model.includes("sonnet")) return "max"; // sonnet rejects xhigh, accepts max
   return "high";
