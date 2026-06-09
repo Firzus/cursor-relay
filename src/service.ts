@@ -90,12 +90,8 @@ async function safeUnlink(path: string): Promise<void> {
   try {
     await unlink(path);
   } catch (err) {
-    if (!hasErrorCode(err, "ENOENT")) throw err;
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
-}
-
-function hasErrorCode(err: unknown, code: string): boolean {
-  return typeof err === "object" && err !== null && "code" in err && err.code === code;
 }
 
 function trimOutput(text: string): string {

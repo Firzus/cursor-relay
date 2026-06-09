@@ -1,41 +1,6 @@
 import { test, expect } from "bun:test";
 import { anthropicStreamToOpenAI, buildAnthropicRequest, CACHE_CONTROL, CLAUDE_CODE_IDENTITY } from "./translate.ts";
-
-// --- stream test helpers ---------------------------------------------------
-function anthropicSSE(events: Array<{ event: string; data: unknown }>): ReadableStream<Uint8Array> {
-  const enc = new TextEncoder();
-  const text = events.map((e) => `event: ${e.event}\ndata: ${JSON.stringify(e.data)}\n\n`).join("");
-  return new ReadableStream<Uint8Array>({
-    start(c) {
-      c.enqueue(enc.encode(text));
-      c.close();
-    },
-  });
-}
-
-async function collectText(stream: ReadableStream<Uint8Array>): Promise<string> {
-  const reader = stream.getReader();
-  const dec = new TextDecoder();
-  let out = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    out += dec.decode(value, { stream: true });
-  }
-  return out;
-}
-
-interface OpenAIChunk {
-  choices?: Array<{ delta?: Record<string, unknown>; finish_reason?: string | null }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
-}
-function parseOpenAIChunks(sse: string): OpenAIChunk[] {
-  return sse
-    .split("\n\n")
-    .map((b) => b.replace(/^data: /, "").trim())
-    .filter((d) => d.length > 0 && d !== "[DONE]")
-    .map((d) => JSON.parse(d) as OpenAIChunk);
-}
+import { collectText, parseOpenAIChunks, sseStream as anthropicSSE } from "../test-helpers.ts";
 
 test("injects the Claude Code identity as the first system block, Cursor's system second", () => {
   const body = {
@@ -69,7 +34,9 @@ test("maps effort to adaptive thinking + output_config.effort, clamping 'extra' 
   expect(sonnetHigh.thinking).toEqual({ type: "adaptive", display: "summarized" });
   expect(sonnetHigh.output_config).toEqual({ effort: "high" });
 
-  // 'extra' clamps differently: opus accepts xhigh, sonnet rejects xhigh but accepts max.
+  // 'extra' clamps differently: fable/opus accept xhigh, sonnet rejects xhigh but accepts max.
+  const fableExtra = buildAnthropicRequest(body, { model: "claude-fable-5", effort: "extra" });
+  expect(fableExtra.output_config).toEqual({ effort: "xhigh" });
   const opusExtra = buildAnthropicRequest(body, { model: "claude-opus-4-8", effort: "extra" });
   expect(opusExtra.output_config).toEqual({ effort: "xhigh" });
   const sonnetExtra = buildAnthropicRequest(body, { model: "claude-sonnet-4-6", effort: "extra" });

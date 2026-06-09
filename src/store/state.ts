@@ -43,7 +43,7 @@ export function nextPeriod(period: Period): Period {
 /** Used the first time the store is opened with no selection yet. */
 export const DEFAULT_SELECTION: Selection = {
   provider: "claude",
-  model: "claude-sonnet-4-6",
+  model: "claude-opus-4-8",
   effort: "medium",
 };
 

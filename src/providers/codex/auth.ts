@@ -7,11 +7,11 @@ import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
 import { dirname } from "node:path";
 import { CODEX_AUTH } from "../../paths.ts";
 import type { AuthStatus } from "../types.ts";
+import { createAuthCache, tokenNeedsRefresh } from "../shared.ts";
 
 const TOKEN_URL = "https://auth.openai.com/oauth/token";
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const SCOPE = "openid profile email offline_access";
-const REFRESH_MARGIN_MS = 60_000;
 
 export interface CodexClaims {
   accessToken: string;
@@ -24,7 +24,7 @@ export interface CodexClaims {
 
 /** True when the token is expired or within the refresh margin of expiring. */
 export function needsRefresh(claims: CodexClaims, now: number): boolean {
-  return now >= claims.expiresAt - REFRESH_MARGIN_MS;
+  return tokenNeedsRefresh(claims.expiresAt, now);
 }
 
 /** The OAuth refresh request shape the Codex CLI uses (form-urlencoded). */
@@ -103,20 +103,11 @@ function decodeJwt(token: string): Record<string, unknown> {
 
 // --- credential loading + refresh (network/file) ----------------------------
 
-let cached: CodexClaims | null = null;
-
-export async function getAuth(forceRefresh = false): Promise<CodexClaims> {
-  if (!forceRefresh && cached && !needsRefresh(cached, Date.now())) return cached;
+export const { getAuth, invalidateAuthCache } = createAuthCache<CodexClaims>(async (forceRefresh) => {
   const raw = await readAuthFile();
-  let claims = parseCodexAuth(raw);
-  if (forceRefresh || needsRefresh(claims, Date.now())) claims = await refresh(raw, claims);
-  cached = claims;
-  return claims;
-}
-
-export function invalidateAuthCache(): void {
-  cached = null;
-}
+  const claims = parseCodexAuth(raw);
+  return forceRefresh || needsRefresh(claims, Date.now()) ? refresh(raw, claims) : claims;
+});
 
 export async function authStatus(): Promise<AuthStatus> {
   try {

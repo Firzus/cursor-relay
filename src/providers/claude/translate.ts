@@ -1,6 +1,7 @@
 import type { Effort } from "../types.ts";
 import { CACHE_TTL } from "../../config.ts";
-import { chatChunk, newCompletionId, sse, SSE_DONE } from "../../openai.ts";
+import { chatChunk, extractText, newCompletionId, sse, SSE_DONE } from "../../openai.ts";
+import { parseSSEEvent, sseBlocks } from "../../sse.ts";
 
 /**
  * OpenAI Chat Completions <-> Anthropic Messages translation for the Claude
@@ -174,7 +175,7 @@ function mapTools(tools: unknown): Array<Record<string, unknown>> | undefined {
   return out;
 }
 
-/** Both models use adaptive thinking; only the effort vocabulary differs. */
+/** All models use adaptive thinking; only the effort vocabulary differs. */
 export function mapThinking(
   model: string,
   effort: Effort,
@@ -187,6 +188,7 @@ export function mapThinking(
 
 function mapEffort(model: string, effort: Effort): string {
   if (effort !== "extra") return effort; // low/medium/high pass through unchanged
+  if (model.includes("fable")) return "xhigh"; // fable supports xhigh and max; xhigh is the agentic sweet spot
   if (model.includes("opus")) return "xhigh"; // opus-only top tier
   if (model.includes("sonnet")) return "max"; // sonnet rejects xhigh, accepts max
   return "high";
@@ -199,17 +201,6 @@ function safeParseJson(s: unknown): unknown {
   } catch {
     return {};
   }
-}
-
-function extractText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((p) => (p && typeof p === "object" && typeof (p as { text?: unknown }).text === "string" ? (p as { text: string }).text : ""))
-      .filter(Boolean)
-      .join("");
-  }
-  return "";
 }
 
 // --- streaming: Anthropic Messages SSE -> OpenAI chat.completion.chunk -------
@@ -365,38 +356,13 @@ function mapStopReason(reason: string): string {
 }
 
 async function* parseAnthropicSSE(stream: ReadableStream<Uint8Array>): AsyncGenerator<unknown> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let idx: number;
-      while ((idx = buffer.indexOf("\n\n")) !== -1) {
-        const block = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        const parsed = parseSSEBlock(block);
-        if (parsed !== undefined) yield parsed;
-      }
+  for await (const block of sseBlocks(stream)) {
+    const ev = parseSSEEvent(block);
+    if (!ev) continue;
+    try {
+      yield JSON.parse(ev.data);
+    } catch {
+      // skip non-JSON data blocks
     }
-    const tail = parseSSEBlock(buffer);
-    if (tail !== undefined) yield tail;
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-function parseSSEBlock(block: string): unknown {
-  const dataLines: string[] = [];
-  for (const line of block.split(/\r?\n/)) {
-    if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
-  }
-  if (dataLines.length === 0) return undefined;
-  try {
-    return JSON.parse(dataLines.join("\n"));
-  } catch {
-    return undefined;
   }
 }

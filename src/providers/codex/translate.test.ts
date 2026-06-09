@@ -46,21 +46,7 @@ test("maps assistant tool_calls to function_call and tool results to function_ca
 
 // --- stream helpers ---
 import { responsesStreamToOpenAI } from "./translate.ts";
-function responsesSSE(events: Array<{ event: string; data: unknown }>): ReadableStream<Uint8Array> {
-  const enc = new TextEncoder();
-  const text = events.map((e) => `event: ${e.event}\ndata: ${JSON.stringify(e.data)}\n\n`).join("");
-  return new ReadableStream<Uint8Array>({ start(c) { c.enqueue(enc.encode(text)); c.close(); } });
-}
-async function collectText(stream: ReadableStream<Uint8Array>): Promise<string> {
-  const reader = stream.getReader();
-  const dec = new TextDecoder();
-  let out = "";
-  for (;;) { const { value, done } = await reader.read(); if (done) break; out += dec.decode(value, { stream: true }); }
-  return out;
-}
-function parseOpenAIChunks(sse: string): any[] {
-  return sse.split("\n\n").map((b) => b.replace(/^data: /, "").trim()).filter((d) => d.length > 0 && d !== "[DONE]").map((d) => JSON.parse(d));
-}
+import { collectText, parseOpenAIChunks, sseStream as responsesSSE } from "../test-helpers.ts";
 
 test("translates Responses output_text deltas to OpenAI content chunks with usage and [DONE]", async () => {
   const upstream = responsesSSE([
@@ -73,7 +59,7 @@ test("translates Responses output_text deltas to OpenAI content chunks with usag
   const chunks = parseOpenAIChunks(out);
   const content = chunks.flatMap((c) => (typeof c.choices?.[0]?.delta?.content === "string" ? [c.choices[0].delta.content] : [])).join("");
   expect(content).toBe("Hello world");
-  expect(chunks.find((c) => c.choices?.[0]?.finish_reason)?.choices[0].finish_reason).toBe("stop");
+  expect(chunks.find((c) => c.choices?.[0]?.finish_reason)?.choices?.[0]?.finish_reason).toBe("stop");
   expect(chunks.find((c) => c.usage)?.usage).toEqual({ prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
 });
 
@@ -120,5 +106,5 @@ test("translates Responses function_call streaming to OpenAI tool_calls", async 
   const toolDeltas = chunks.flatMap((c) => c.choices?.[0]?.delta?.tool_calls ?? []);
   expect(toolDeltas.find((t: any) => t.id)).toMatchObject({ index: 0, id: "call_1", type: "function", function: { name: "Glob" } });
   expect(toolDeltas.map((t: any) => t.function?.arguments ?? "").join("")).toBe('{"x":1}');
-  expect(chunks.find((c) => c.choices?.[0]?.finish_reason)?.choices[0].finish_reason).toBe("tool_calls");
+  expect(chunks.find((c) => c.choices?.[0]?.finish_reason)?.choices?.[0]?.finish_reason).toBe("tool_calls");
 });

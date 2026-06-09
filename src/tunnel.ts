@@ -48,14 +48,15 @@ export async function openTunnel(): Promise<TunnelHandle> {
       : `https://${TUNNEL_HOSTNAME}`
     : null;
 
+  // Single lifecycle state; "connecting" covers both the initial dial and the
+  // gap between an exit and the next reconnect attempt.
+  let state: "connecting" | "connected" | "closed" = "connecting";
+  // TS narrows the captured `state` literal across the await below and rejects
+  // direct comparisons; reading through a function keeps the full union.
+  const isConnected = (): boolean => state === "connected";
   let cf: CfTunnel | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let closed = false;
-  let connected = false;
-  let signalFirstConnect: (() => void) | null = null;
-  const firstConnect = new Promise<void>((resolve) => {
-    signalFirstConnect = resolve;
-  });
+  const { promise: firstConnect, resolve: signalFirstConnect } = Promise.withResolvers<void>();
 
   const start = (): void => {
     const instance = CfTunnel.withToken(TUNNEL_TOKEN, { "--url": localUrl });
@@ -67,13 +68,12 @@ export async function openTunnel(): Promise<TunnelHandle> {
     // healthy local proxy with it. Always absorb it; "exit" drives reconnection.
     instance.on("error", (err: Error) => console.warn(`[shim] cloudflared error: ${err.message}`));
     instance.on("connected", () => {
-      connected = true;
-      signalFirstConnect?.();
-      signalFirstConnect = null;
+      if (state !== "closed") state = "connected";
+      signalFirstConnect();
     });
     instance.once("exit", () => {
-      connected = false;
-      if (closed) return;
+      if (state === "closed") return;
+      state = "connecting";
       console.warn("[shim] cloudflared exited; reconnecting…");
       scheduleReconnect();
     });
@@ -81,10 +81,10 @@ export async function openTunnel(): Promise<TunnelHandle> {
   };
 
   const scheduleReconnect = (): void => {
-    if (closed || reconnectTimer !== null) return;
+    if (state === "closed" || reconnectTimer !== null) return;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
-      if (!closed) start();
+      if (state !== "closed") start();
     }, RECONNECT_DELAY_MS);
   };
 
@@ -94,7 +94,7 @@ export async function openTunnel(): Promise<TunnelHandle> {
   // fail. At boot the network/DNS is often not ready in time; the tunnel keeps
   // retrying in the background while the proxy serves.
   await waitOrTimeout(firstConnect, TUNNEL_READY_TIMEOUT_MS);
-  if (!connected) {
+  if (!isConnected()) {
     console.warn(
       `[shim] tunnel not connected within ${TUNNEL_READY_TIMEOUT_MS / 1000}s — ` +
         "retrying in the background; the local proxy stays up.",
@@ -104,15 +104,17 @@ export async function openTunnel(): Promise<TunnelHandle> {
   return {
     url,
     get connected() {
-      return connected;
+      return isConnected();
     },
     async close() {
-      closed = true;
+      state = "closed";
       if (reconnectTimer !== null) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
       if (cf) {
+        // Best-effort teardown: the process may already be gone, and shutdown
+        // must never throw past this point.
         try {
           cf.removeAllListeners();
         } catch {
