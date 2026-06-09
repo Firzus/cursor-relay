@@ -11,6 +11,32 @@ export function tokenNeedsRefresh(expiresAt: number, now: number): boolean {
   return now >= expiresAt - REFRESH_MARGIN_MS;
 }
 
+export interface AuthCache<Claims> {
+  /** Return valid claims, refreshing the token proactively or on demand. */
+  getAuth(forceRefresh?: boolean): Promise<Claims>;
+  invalidateAuthCache(): void;
+}
+
+/**
+ * In-memory claims cache shared by the providers: serve cached claims while
+ * they are fresh, otherwise delegate to `loadFresh` (read + parse + refresh).
+ */
+export function createAuthCache<Claims extends { expiresAt: number }>(
+  loadFresh: (forceRefresh: boolean) => Promise<Claims>,
+): AuthCache<Claims> {
+  let cached: Claims | null = null;
+  return {
+    async getAuth(forceRefresh = false) {
+      if (!forceRefresh && cached && !tokenNeedsRefresh(cached.expiresAt, Date.now())) return cached;
+      cached = await loadFresh(forceRefresh);
+      return cached;
+    },
+    invalidateAuthCache() {
+      cached = null;
+    },
+  };
+}
+
 /**
  * Call upstream with fresh credentials, force-refreshing and retrying once on
  * 401 (the token may have been revoked out from under the cache).

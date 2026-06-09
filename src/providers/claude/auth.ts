@@ -6,7 +6,7 @@ import { readFile, writeFile, mkdir, rename } from "node:fs/promises";
 import { dirname } from "node:path";
 import { CLAUDE_CREDENTIALS } from "../../paths.ts";
 import type { AuthStatus } from "../types.ts";
-import { tokenNeedsRefresh } from "../shared.ts";
+import { createAuthCache, tokenNeedsRefresh } from "../shared.ts";
 
 export interface ClaudeClaims {
   accessToken: string;
@@ -74,21 +74,10 @@ export function parseCredentials(raw: string): ClaudeClaims {
 
 // --- credential loading + refresh (network/file) ----------------------------
 
-let cached: ClaudeClaims | null = null;
-
-/** Return valid claims, refreshing the token proactively or on demand. */
-export async function getAuth(forceRefresh = false): Promise<ClaudeClaims> {
-  if (!forceRefresh && cached && !needsRefresh(cached, Date.now())) return cached;
-
+export const { getAuth, invalidateAuthCache } = createAuthCache<ClaudeClaims>(async (forceRefresh) => {
   const claims = parseCredentials(await readCreds());
-  const fresh = forceRefresh || needsRefresh(claims, Date.now()) ? await refresh(claims) : claims;
-  cached = fresh;
-  return fresh;
-}
-
-export function invalidateAuthCache(): void {
-  cached = null;
-}
+  return forceRefresh || needsRefresh(claims, Date.now()) ? refresh(claims) : claims;
+});
 
 export async function authStatus(): Promise<AuthStatus> {
   try {
