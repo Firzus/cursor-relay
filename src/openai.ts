@@ -37,7 +37,12 @@ export const SSE_DONE = "data: [DONE]\n\n";
 
 export const SSE_HEADERS: Record<string, string> = {
   "content-type": "text/event-stream",
-  "cache-control": "no-cache",
+  // `no-transform` forbids intermediaries (the Cloudflare edge, any buffering
+  // proxy) from compressing or rewriting the body; `x-accel-buffering: no`
+  // disables proxy-level response buffering. Together they keep streamed tokens
+  // from being clumped before they reach Cursor. See issue #30.
+  "cache-control": "no-cache, no-transform",
+  "x-accel-buffering": "no",
   connection: "keep-alive",
 };
 
