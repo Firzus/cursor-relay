@@ -77,3 +77,14 @@ Decisions made:
 - The NULL-exclusion also protects the rate from future unmeasured rows (e.g. a
   stream that errors before reporting usage), which the time-windowed version
   silently scored as misses.
+
+## Amendment (TUI panel redesign, 2026-06-10)
+
+The single store read behind the rate is now `recentCacheSamples(n)`, which
+returns the per-request `(cached, input)` pairs of the same last-N-measured
+window (oldest → newest) instead of pre-summed totals. The TUI derives **both**
+the aggregate percent (`Σcached / Σinput` — unchanged definition) and the
+per-request cache-rate sparkline from that one sample, so the two can never
+disagree. Cache creation is still never folded into the rate; a cold cache
+write stays visible via the `wrote` witness on the activity row and as a
+trough in the sparkline.
