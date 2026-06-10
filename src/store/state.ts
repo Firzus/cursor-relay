@@ -144,35 +144,38 @@ export function recentActivity(limit = 50): ActivityRow[] {
     .all({ $limit: limit }) as ActivityRow[];
 }
 
+/** One measured request's cache sample: its cached + prompt token counts. */
+export interface CacheSample {
+  cached: number;
+  input: number;
+}
+
 /**
- * Token-weighted cache totals over the last `n` **measured** requests (newest
- * by id). A row is measured only when both token columns are present; a NULL in
- * either is *unmeasured* — a pending request, or one recorded by an older build
- * that never reported cache tokens — and is excluded outright, not counted as a
- * 0% miss that would drag the rate down. The cache rate is `cached / input`.
- * `db` is injectable for tests against a temporary database. See ADR-0003.
+ * Per-request cache samples over the last `n` **measured** requests, returned
+ * oldest → newest. A row is measured only when both token columns are present;
+ * a NULL in either is *unmeasured* — a pending request, or one recorded by an
+ * older build that never reported cache tokens — and is excluded outright, not
+ * counted as a 0% miss that would drag the rate down. This is the single store
+ * read behind the cache rate: the TUI derives both the aggregate rate
+ * (`Σcached / Σinput`) and the per-request sparkline from the same sample, so
+ * the two can never disagree. `db` is injectable for tests. See ADR-0003.
  */
-export function cacheTotalsRecent(
-  n = CACHE_RATE_SAMPLE,
-  db: Database = getDb(),
-): { cached: number; input: number } {
-  const row = db
+export function recentCacheSamples(n = CACHE_RATE_SAMPLE, db: Database = getDb()): CacheSample[] {
+  const rows = db
     .query(
-      `SELECT COALESCE(SUM(cached_tokens), 0) AS cached,
-              COALESCE(SUM(prompt_tokens), 0) AS input
-         FROM (SELECT cached_tokens, prompt_tokens FROM activity
-                WHERE cached_tokens IS NOT NULL AND prompt_tokens IS NOT NULL
-                ORDER BY id DESC LIMIT $n)`,
+      `SELECT cached_tokens AS cached, prompt_tokens AS input FROM activity
+        WHERE cached_tokens IS NOT NULL AND prompt_tokens IS NOT NULL
+        ORDER BY id DESC LIMIT $n`,
     )
-    .get({ $n: n }) as { cached: number; input: number };
-  return { cached: row.cached, input: row.input };
+    .all({ $n: n }) as CacheSample[];
+  return rows.reverse();
 }
 
 /**
  * Request + error counts over a bounded window — rows with `ts >= since`.
  * `requests` is every row in the window (all statuses); `errors` is the subset
  * with `status = 'error'`. The `w` period scopes these counters only; the cache
- * rate is request-count scoped (see [[cacheTotalsRecent]]). Pass `since = 0` for
+ * rate is request-count scoped (see [[recentCacheSamples]]). Pass `since = 0` for
  * the whole table. `db` is injectable for tests against a temporary database.
  */
 export function windowedCounters(

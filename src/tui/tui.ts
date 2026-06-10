@@ -17,7 +17,7 @@ import { PORT, TUNNEL_HOSTNAME } from "../config.ts";
 import { allProviders, getProvider } from "../providers/registry.ts";
 import {
   CACHE_RATE_SAMPLE,
-  cacheTotalsRecent,
+  type CacheSample,
   DEFAULT_PERIOD,
   getPlanUsage,
   getSelection,
@@ -27,10 +27,12 @@ import {
   periodSince,
   type PlanWindow,
   recentActivity,
+  recentCacheSamples,
   setSelection,
   windowedCounters,
 } from "../store/state.ts";
-import type { AuthStatus, Effort, ProviderId, Selection } from "../providers/types.ts";
+import type { AuthStatus, Effort, ProviderId, ProviderModel, Selection } from "../providers/types.ts";
+import { createClipboard } from "./clipboard.ts";
 
 /** Keep the current effort if the target model supports it, else fall back to its first (or "medium"). */
 export function preserveEffort(efforts: readonly Effort[], current: Effort): Effort {
@@ -53,7 +55,7 @@ export function abbreviateCount(n: number): string {
  * `prompt_tokens`, but only the cold write shows `wrote Y`. Both segments can
  * appear together (`cached X, wrote Y`). Each is omitted when its count is 0 or
  * unmeasured, to avoid `cached 0` / `wrote 0` noise. Empty when no token counts
- * were recorded (e.g. a pending row). Pure (no color) — prior art: formatCacheRate.
+ * were recorded (e.g. a pending row). Pure (no color) — prior art: cacheRateView.
  */
 export function formatActivityTokens(row: {
   prompt_tokens: number | null;
@@ -103,19 +105,37 @@ export function formatResetCountdown(resetAt: number, now: number): string {
 
 const BAR_WIDTH = 10;
 
+/** One plan-usage line, split so the mount can colour each part by its role. */
+export interface PlanUsageParts {
+  /** Window label, padded for vertical alignment — dim. */
+  label: string;
+  /** The usage bar — coloured by `usageLevel`. */
+  bar: string;
+  /** The percent, width-stable — coloured by `usageLevel`. */
+  pct: string;
+  /** The reset countdown — neutral, readable regardless of usage level. */
+  reset: string;
+  /** A non-"allowed" status (e.g. "rejected"), or "" — surfaced as critical. */
+  flag: string;
+}
+
 /**
- * Render one plan-usage bar (without colour): `5h     [████░░░░░░]  71%  resets in 1h 2m`.
- * Utilization is a 0–1 fraction; the caller colours by `usageLevel`. A status
- * other than "allowed" (e.g. "rejected") is appended so a throttled window is
- * visible, not just implied by the colour. Pure.
+ * Render one plan-usage line as parts (without colour): label, `[████░░░░░░]`,
+ * ` 71%`, `resets in 1h 2m`, and a status flag when the window is not
+ * "allowed" — so a throttled window is visible, not just implied by colour.
+ * Utilization is a 0–1 fraction; the caller colours the bar + percent by
+ * `usageLevel` and keeps the label and countdown neutral. Pure.
  */
-export function formatPlanUsage(label: string, window: PlanWindow, now: number): string {
+export function planUsageParts(label: string, window: PlanWindow, now: number): PlanUsageParts {
   const frac = Math.max(0, Math.min(1, window.utilization));
   const filled = Math.round(frac * BAR_WIDTH);
-  const bar = "█".repeat(filled) + "░".repeat(BAR_WIDTH - filled);
-  const pct = Math.round(frac * 100);
-  const flag = window.status && window.status !== "allowed" ? `  ${window.status}` : "";
-  return `${label.padEnd(7)}[${bar}] ${String(pct).padStart(3)}%  resets in ${formatResetCountdown(window.resetAt, now)}${flag}`;
+  return {
+    label: label.padEnd(7),
+    bar: `[${"█".repeat(filled)}${"░".repeat(BAR_WIDTH - filled)}]`,
+    pct: `${String(Math.round(frac * 100)).padStart(3)}%`,
+    reset: `resets in ${formatResetCountdown(window.resetAt, now)}`,
+    flag: window.status && window.status !== "allowed" ? window.status : "",
+  };
 }
 
 /**
@@ -130,27 +150,74 @@ export function optimisticReset(window: PlanWindow, now: number): PlanWindow {
   return window;
 }
 
+/** 0–1 rate → block glyph, lowest to highest. */
+const SPARK_GLYPHS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
+
 /**
- * Render the cache-rate line body (without color) over the last `sample`
- * measured requests. Returns the dim dash form when there is no usable input.
+ * Map a sequence of 0–1 rates to block glyphs, one per rate in order — the
+ * shape of the recent cache behaviour, where a cold cache write reads as a
+ * visible trough. Rates are clamped into the glyph scale. Pure.
  */
-export function formatCacheRate(totals: { cached: number; input: number }, sample: number): string {
-  if (totals.input <= 0) return `cache rate (last ${sample})  —`;
-  const pct = Math.round((totals.cached / totals.input) * 100);
-  return `cache rate (last ${sample})  ${pct}%  (${abbreviateCount(totals.cached)} cached / ${abbreviateCount(totals.input)} input)`;
+export function sparkline(rates: readonly number[]): string {
+  return rates
+    .map((r) => {
+      const i = Math.min(SPARK_GLYPHS.length - 1, Math.max(0, Math.floor(r * SPARK_GLYPHS.length)));
+      return SPARK_GLYPHS[i]!;
+    })
+    .join("");
+}
+
+/** The cache-rate line, split so the mount can colour each part by its role. */
+export interface CacheRateView {
+  /** `cache rate (last N)` — dim. */
+  label: string;
+  /** One glyph per measured request, oldest → newest; "" on an empty sample. */
+  spark: string;
+  /** Aggregate percent (or the dash form when the sample is empty) — value brightness. */
+  value: string;
+  /** `1.2k cached / 2.7k input`, or "" on an empty sample — dim. */
+  detail: string;
 }
 
 /**
- * The counters line for the metrics panel: requests + errors over the selected
- * `w` period, plus the live in-flight count (point-in-time, not windowed). The
- * period label is shown so the `w` key's target is legible now that it scopes
- * the counters only. Counts are abbreviated like the rest of the panel. Pure.
+ * Derive the cache-rate line from the per-request samples (oldest → newest).
+ * Both the per-request sparkline and the aggregate percent come from the same
+ * sample, so the two can never disagree; per ADR-0003 the aggregate stays
+ * `Σcached / Σinput` over the request-count window and cache creation is never
+ * folded in. An empty sample renders the dash form. Pure.
  */
-export function formatCounters(
-  c: { requests: number; errors: number; inFlight: number },
-  period: Period,
-): string {
-  return `requests ${abbreviateCount(c.requests)}  ·  errors ${abbreviateCount(c.errors)}  ·  in-flight ${abbreviateCount(c.inFlight)}  (${period})`;
+export function cacheRateView(samples: readonly CacheSample[], sample: number): CacheRateView {
+  const label = `cache rate (last ${sample})`;
+  const cached = samples.reduce((sum, s) => sum + s.cached, 0);
+  const input = samples.reduce((sum, s) => sum + s.input, 0);
+  if (input <= 0) return { label, spark: "", value: "—", detail: "" };
+  return {
+    label,
+    spark: sparkline(samples.map((s) => (s.input > 0 ? s.cached / s.input : 0))),
+    value: `${Math.round((cached / input) * 100)}%`,
+    detail: `${abbreviateCount(cached)} cached / ${abbreviateCount(input)} input`,
+  };
+}
+
+/** One labelled value for the traffic section — label dim, value bright. */
+export interface LabelledValue {
+  label: string;
+  value: string;
+}
+
+/**
+ * The counters line as label/value pairs: requests + errors over the selected
+ * `w` period, plus the period itself under the `window` label so the `w` key's
+ * target is legible. In-flight load lives in the activity frame title, where
+ * the requests themselves appear. Counts are abbreviated like the rest of the
+ * panel. Pure.
+ */
+export function countersView(c: { requests: number; errors: number }, period: Period): LabelledValue[] {
+  return [
+    { label: "requests", value: abbreviateCount(c.requests) },
+    { label: "errors", value: abbreviateCount(c.errors) },
+    { label: "window", value: period },
+  ];
 }
 
 /** Minimum terminal size the three-zone chrome needs to render legibly. */
@@ -244,6 +311,33 @@ export function formatElapsed(ts: number, now: number): string {
   return `${m}m ${s}s`;
 }
 
+/**
+ * The status column content: glyph + word so state is legible even when colour
+ * rendering is poor — `✓ ok`, `✗ error`, a braille spinner while pending, the
+ * raw word for anything else. Pure (the spinner is a function of `now`).
+ */
+export function statusCellText(status: string, now: number): string {
+  if (status === "ok") return "✓ ok";
+  if (status === "error") return "✗ error";
+  if (status === "pending") return spinnerFrame(now);
+  return status;
+}
+
+/** A model's display label as a compact slug for the source column (e.g. "Fable 5" → "fable-5"). Pure. */
+export function slugLabel(label: string): string {
+  return label.toLowerCase().replace(/\s+/g, "-");
+}
+
+/**
+ * The activity frame title: a live in-flight count (with spinner) when requests
+ * are pending — load shown where the requests themselves appear — and the plain
+ * title when idle. Pure.
+ */
+export function activityTitle(inFlight: number, now: number): string {
+  if (inFlight <= 0) return " activity ";
+  return ` activity · ${spinnerFrame(now)} ${abbreviateCount(inFlight)} in-flight `;
+}
+
 /** The kind of an activity column, so the mount can colour each segment. */
 export type ActivityCellKind = "time" | "status" | "source" | "tokens" | "note" | "duration" | "elapsed";
 
@@ -268,51 +362,295 @@ interface ActivityRowInput {
 }
 
 /**
- * Ordered, plain-text columns for one activity row (left→right):
- * `time · status · provider/model · in→out (cached) · duration`. A pending row
- * is live: its status slot animates a spinner (driven by `now`) and its tail
- * slot shows a ticking elapsed timer in place of the duration. On a finalized
- * row the 4th slot carries the token witness, or — on an error row with a note —
- * the note (truncated) so a failure is diagnosable inline; empty slots are
- * omitted. Colour is the caller's job; pure, and takes the already-formatted
- * `timeStr` plus an injected `now` so tests stay deterministic.
+ * The five fixed table slots of one activity row (left→right): time, status
+ * (glyph + word), source (`provider/short-label`, via the optional `labels`
+ * map), witness, duration. The witness slot carries the token segment, an error
+ * row's truncated note, or a pending row's ticking elapsed timer; the duration
+ * slot is "" when not yet known. Every row emits all five slots (empty text
+ * where there is nothing) so `padColumns` can align them into fixed-width
+ * columns across rows. Colour is the caller's job; pure, and takes the
+ * already-formatted `timeStr` plus an injected `now` so tests stay deterministic.
  */
-export function activityColumns(row: ActivityRowInput, timeStr: string, now: number, noteMax = 32): ActivityCell[] {
-  const source = { text: `${row.provider}/${row.model}`, kind: "source" as const };
+export function activityColumns(
+  row: ActivityRowInput,
+  timeStr: string,
+  now: number,
+  opts: { noteMax?: number; labels?: ReadonlyMap<string, string> } = {},
+): ActivityCell[] {
+  const short = opts.labels?.get(row.model) ?? row.model;
+  const cells: ActivityCell[] = [
+    { text: timeStr, kind: "time" },
+    { text: statusCellText(row.status, now), kind: "status" },
+    { text: `${row.provider}/${short}`, kind: "source" },
+  ];
   if (row.status === "pending") {
-    return [
-      { text: timeStr, kind: "time" },
-      { text: spinnerFrame(now), kind: "status" },
-      source,
-      { text: formatElapsed(row.ts, now), kind: "elapsed" },
-    ];
-  }
-  const cells: ActivityCell[] = [{ text: timeStr, kind: "time" }, { text: row.status, kind: "status" }, source];
-  if (row.status === "error" && row.note) {
-    cells.push({ text: truncateDetail(row.note, noteMax), kind: "note" });
+    cells.push({ text: formatElapsed(row.ts, now), kind: "elapsed" });
+  } else if (row.status === "error" && row.note) {
+    cells.push({ text: truncateDetail(row.note, opts.noteMax ?? 32), kind: "note" });
   } else {
-    const tokens = formatActivityTokens(row).trim();
-    if (tokens) cells.push({ text: tokens, kind: "tokens" });
+    cells.push({ text: formatActivityTokens(row).trim(), kind: "tokens" });
   }
-  if (row.duration_ms != null) cells.push({ text: `${row.duration_ms}ms`, kind: "duration" });
+  cells.push({ text: row.duration_ms != null ? `${row.duration_ms}ms` : "", kind: "duration" });
   return cells;
 }
 
 /**
- * Keep the leftmost columns that fit within `width` (joined by a single space),
- * dropping the rightmost columns first so a narrow terminal sheds duration, then
- * the token/note witness, etc., rather than wrapping. Pure.
+ * Pad each slot to its column's max width across all rows so the stream renders
+ * as an aligned table: duration is right-aligned (outlier latencies jump out),
+ * everything else left-aligned. Pure.
  */
-export function clipColumns(cells: ActivityCell[], width: number): ActivityCell[] {
+export function padColumns(rows: ActivityCell[][]): ActivityCell[][] {
+  const widths: number[] = [];
+  for (const row of rows) {
+    row.forEach((cell, i) => {
+      widths[i] = Math.max(widths[i] ?? 0, cell.text.length);
+    });
+  }
+  return rows.map((row) =>
+    row.map((cell, i) => ({
+      ...cell,
+      text: cell.kind === "duration" ? cell.text.padStart(widths[i]!) : cell.text.padEnd(widths[i]!),
+    })),
+  );
+}
+
+/**
+ * Keep the leftmost columns that fit within `width` (joined by a `gap`-space
+ * separator), dropping the rightmost columns first so a narrow terminal sheds
+ * duration, then the witness, etc., rather than wrapping. Pure.
+ */
+export function clipColumns(cells: ActivityCell[], width: number, gap = 1): ActivityCell[] {
   const kept: ActivityCell[] = [];
   let used = 0;
   for (const cell of cells) {
-    const add = (kept.length ? 1 : 0) + cell.text.length;
+    const add = (kept.length ? gap : 0) + cell.text.length;
     if (used + add > width) break;
     kept.push(cell);
     used += add;
   }
   return kept;
+}
+
+// --- input modes + footer hints (pure) ----------------------------------------
+
+/**
+ * The single modal input-mode concept: while a picker or the error detail is
+ * open, global keys are inert and the footer hints swap to the modal's
+ * controls. The hints presenter takes this kind, so the footer cannot drift
+ * from the actual key handling.
+ */
+export type InputModeKind = "default" | "picker" | "error-detail";
+
+/** One footer hint: the trigger key and the action word it triggers. */
+export interface Hint {
+  key: string;
+  label: string;
+}
+
+/** The footer hints for an input mode — one source for the whole footer. Pure. */
+export function hintsFor(mode: InputModeKind): Hint[] {
+  switch (mode) {
+    case "picker":
+      return [
+        { key: "↑↓", label: "move" },
+        { key: "⏎", label: "select" },
+        { key: "esc", label: "cancel" },
+      ];
+    case "error-detail":
+      return [{ key: "esc", label: "close" }];
+    default:
+      return [
+        { key: "p", label: "provider" },
+        { key: "m", label: "model" },
+        { key: "e", label: "effort" },
+        { key: "w", label: "window" },
+        { key: "c", label: "copy" },
+        { key: "q", label: "quit" },
+      ];
+  }
+}
+
+/**
+ * Split a hint into its keycap and the rest of the word: `[p]` + `rovider` when
+ * the label starts with the key, `[esc]` + ` cancel` otherwise — so the mount
+ * highlights the trigger and dims the remainder. Pure.
+ */
+export function keycapParts(hint: Hint): { cap: string; rest: string } {
+  const cap = `[${hint.key}]`;
+  const rest = hint.label.startsWith(hint.key) ? hint.label.slice(hint.key.length) : ` ${hint.label}`;
+  return { cap, rest };
+}
+
+// --- selection pickers (pure state machine) ------------------------------------
+
+/** Which selection a picker chooses, matching its trigger key (p/m/e). */
+export type PickerKind = "provider" | "model" | "effort";
+
+/** One selectable option: the id committed to the store + its display label. */
+export interface PickerOption {
+  id: string;
+  label: string;
+}
+
+/** A picker's whole state: its options, the highlight, and the current choice. */
+export interface PickerState {
+  kind: PickerKind;
+  options: PickerOption[];
+  /** The highlighted row (moved by ↑↓ / repeat trigger key). */
+  index: number;
+  /** The row holding the current selection, marked in the list. */
+  currentIndex: number;
+}
+
+/** A pure snapshot of the provider registry, so the picker machine needs no I/O. */
+export interface ProviderCatalogEntry {
+  id: ProviderId;
+  models: readonly ProviderModel[];
+}
+export type ProviderCatalog = readonly ProviderCatalogEntry[];
+
+/**
+ * Open a picker for `kind`: providers by id, the active provider's models by
+ * short label, or the active model's efforts — with the current choice marked
+ * and highlighted. Null when there is nothing to pick (unknown selection). Pure.
+ */
+export function openPicker(kind: PickerKind, sel: Selection, catalog: ProviderCatalog): PickerState | null {
+  let options: PickerOption[] = [];
+  if (kind === "provider") {
+    options = catalog.map((p) => ({ id: p.id, label: p.id }));
+  } else {
+    const provider = catalog.find((p) => p.id === sel.provider);
+    if (kind === "model") {
+      options = (provider?.models ?? []).map((m) => ({ id: m.id, label: m.label }));
+    } else {
+      const model = provider?.models.find((m) => m.id === sel.model);
+      options = (model?.efforts ?? []).map((e) => ({ id: e, label: e }));
+    }
+  }
+  if (!options.length) return null;
+  const current = kind === "provider" ? sel.provider : kind === "model" ? sel.model : sel.effort;
+  const currentIndex = Math.max(0, options.findIndex((o) => o.id === current));
+  return { kind, options, index: currentIndex, currentIndex };
+}
+
+/** Move the highlight by `delta`, wrapping — repeat-trigger advance is `+1`. Pure. */
+export function movePicker(state: PickerState, delta: number): PickerState {
+  const n = state.options.length;
+  return { ...state, index: (((state.index + delta) % n) + n) % n };
+}
+
+/**
+ * The committed selection for a picker's highlighted option. A provider change
+ * lands on the provider's first model; provider/model changes preserve the
+ * current effort when the target supports it (else fall back), so switching
+ * backends never silently changes reasoning depth. Committing the already-
+ * current provider is a no-op (the model is not reset). Pure — the caller
+ * writes the result through the store.
+ */
+export function commitPicker(state: PickerState, sel: Selection, catalog: ProviderCatalog): Selection {
+  const chosen = state.options[state.index]!;
+  if (state.kind === "effort") return { ...sel, effort: chosen.id as Effort };
+  if (state.kind === "model") {
+    const provider = catalog.find((p) => p.id === sel.provider);
+    const model = provider?.models.find((m) => m.id === chosen.id);
+    return { ...sel, model: chosen.id, effort: preserveEffort(model?.efforts ?? [], sel.effort) };
+  }
+  if (chosen.id === sel.provider) return sel;
+  const provider = catalog.find((p) => p.id === chosen.id);
+  const first = provider?.models[0];
+  if (!first) return sel;
+  return { provider: chosen.id as ProviderId, model: first.id, effort: preserveEffort(first.efforts, sel.effort) };
+}
+
+/**
+ * The picker overlay's rows: `▸` on the highlight, `●` on the current choice,
+ * so the operator sees both where they are and what is active. Pure — the mount
+ * colours the active row.
+ */
+export function pickerRows(state: PickerState): Array<{ text: string; active: boolean }> {
+  return state.options.map((o, i) => ({
+    text: `${i === state.index ? "▸" : " "} ${i === state.currentIndex ? "●" : " "} ${o.label}`,
+    active: i === state.index,
+  }));
+}
+
+// --- error detail overlay (pure) -----------------------------------------------
+
+/** The most recent error row in a newest-first window, if any. Pure. */
+export function latestError<T extends { status: string }>(rows: readonly T[]): T | undefined {
+  return rows.find((r) => r.status === "error");
+}
+
+/**
+ * Word-wrap `text` to `width` columns, hard-breaking words longer than a line
+ * and preserving explicit newlines. Always returns at least one line. Pure.
+ */
+export function wrapText(text: string, width: number): string[] {
+  const lines: string[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    let line = "";
+    for (let word of raw.split(/\s+/).filter(Boolean)) {
+      while (word.length > width) {
+        if (line) {
+          lines.push(line);
+          line = "";
+        }
+        lines.push(word.slice(0, width));
+        word = word.slice(width);
+      }
+      if (!line) line = word;
+      else if (line.length + 1 + word.length <= width) line += ` ${word}`;
+      else {
+        lines.push(line);
+        line = word;
+      }
+    }
+    lines.push(line);
+  }
+  return lines.length ? lines : [""];
+}
+
+/**
+ * Assemble the error-detail overlay content: a header line (time, source,
+ * duration), the request_id, then the full note wrapped to `width` — truncated
+ * with a `…` line only when it exceeds `maxNoteLines` (a short terminal). Pure.
+ */
+export function errorDetailLines(
+  row: {
+    ts: number;
+    provider: string;
+    model: string;
+    duration_ms: number | null;
+    note: string | null;
+    request_id: string;
+  },
+  timeStr: string,
+  width: number,
+  maxNoteLines = Number.POSITIVE_INFINITY,
+): string[] {
+  const duration = row.duration_ms != null ? `  ${row.duration_ms}ms` : "";
+  const note = wrapText(row.note ?? "(no note recorded)", width);
+  const clipped = note.length > maxNoteLines ? [...note.slice(0, Math.max(1, maxNoteLines - 1)), "…"] : note;
+  return [`${timeStr}  ${row.provider}/${row.model}${duration}`, `request_id ${row.request_id}`, "", ...clipped];
+}
+
+// --- empty state (pure) ----------------------------------------------------------
+
+/** The actionable empty-state content: what to do next instead of a bare placeholder. */
+export interface EmptyState {
+  headline: string;
+  /** The endpoint Cursor should point at — the same URL as the meta strip. */
+  url: string;
+  hint: string;
+}
+
+/** The onboarding content for an empty activity pane. Pure. */
+export function emptyState(url: string): EmptyState {
+  return {
+    headline: "no activity yet — point Cursor at",
+    url,
+    hint: "press [c] to copy the endpoint",
+  };
 }
 
 // --- OpenTUI mount -----------------------------------------------------------
@@ -322,14 +660,32 @@ export function clipColumns(cells: ActivityCell[], width: number): ActivityCell[
 // renderables on each cadence. All formatting decisions live in the pure
 // presenters above; the native core owns differential rendering (no flicker)
 // and the Yoga flexbox layout (the chrome structure).
+//
+// Colour roles, defined once: accent cyan for chrome and the active selection,
+// green/yellow/red strictly semantic, dim reserved for labels, default
+// brightness for values. Status is never conveyed by colour alone (glyphs).
 
-/** Single cyan accent for the chrome (border + title). Semantic status colors stay green/red/yellow. */
+/** Single cyan accent for the chrome (border + title + keycaps). */
 const ACCENT = "#22d3ee";
+
+/** Default-brightness chunk for values — the data the operator's eye lands on. */
+function value(text: string): TextChunk {
+  return stringToStyledText(text).chunks[0] ?? stringToStyledText(" ").chunks[0]!;
+}
+
+/** Semantic level → colour, the single mapping for ok/warn/crit. */
+const LEVEL_COLOR = { ok: green, warn: yellow, crit: red } as const;
 
 /** Cadences, decoupled so auth checks and animation do not piggyback the data poll. */
 const DATA_POLL_MS = 400;
 const RENDER_TICK_MS = 100;
 const AUTH_REFRESH_MS = 5000;
+
+/** How long the meta-strip flash (e.g. `copied ✓`) stays before clearing itself. */
+const FLASH_MS = 1500;
+
+/** Spaces between activity table columns. */
+const COL_GAP = 2;
 
 /** A single space as a default-styled chunk, for inline gaps between styled segments. */
 const SPACE: TextChunk = stringToStyledText(" ").chunks[0]!;
@@ -344,49 +700,46 @@ function joinLines(lines: StyledText[]): StyledText {
   return new StyledText(chunks);
 }
 
-/** Colour one activity cell by its kind; formatting already happened in the presenter. */
+/**
+ * Colour one activity cell by its kind; formatting already happened in the
+ * presenter. Status keeps glyph+word semantics (green/red, spinner yellow);
+ * the token witness and duration are values (default brightness); time and
+ * source are labels (dim). Cells arrive padded, so match on the trimmed text.
+ */
 function colourCell(cell: ActivityCell): TextChunk {
   switch (cell.kind) {
-    case "status":
-      return cell.text === "ok" ? green(cell.text) : cell.text === "error" ? red(cell.text) : yellow(cell.text);
+    case "status": {
+      const word = cell.text.trim();
+      return word === "✓ ok" ? green(cell.text) : word === "✗ error" ? red(cell.text) : yellow(cell.text);
+    }
     case "note":
       return red(cell.text);
     case "elapsed":
       return yellow(cell.text);
+    case "tokens":
+    case "duration":
+      return value(cell.text);
     default:
       return dim(cell.text);
   }
 }
 
 /**
- * One activity row as a styled line: build the plain columns, clip them to the
- * available width (rightmost-first), then colour each surviving cell. `now`
- * drives the spinner + live elapsed on a pending row.
- */
-function activityLine(row: ReturnType<typeof recentActivity>[number], width: number, now: number): StyledText {
-  const timeStr = new Date(row.ts).toLocaleTimeString();
-  const cells = clipColumns(activityColumns(row, timeStr, now), width);
-  const chunks: TextChunk[] = [];
-  cells.forEach((cell, i) => {
-    if (i > 0) chunks.push(SPACE);
-    chunks.push(colourCell(cell));
-  });
-  return new StyledText(chunks);
-}
-
-/**
  * Live control panel. Reads selection + activity from the shared store and
- * writes the selection back when you cycle it — that store is the control
- * channel to the background service.
+ * writes the selection back when you commit a picker — that store is the
+ * control channel to the background service.
  *
- *   p cycle provider · m cycle model · e cycle effort · w window · q quit
+ *   p provider · m model · e effort · w window · c copy · q quit · ⏎ error detail
  */
 export async function runTui(): Promise<void> {
   const providers = allProviders();
-  const providerIds = providers.map((p) => p.id);
+  const catalog: ProviderCatalog = providers.map((p) => ({ id: p.id, models: p.models() }));
+  const modelLabels = new Map<string, string>();
+  for (const entry of catalog) for (const m of entry.models) modelLabels.set(m.id, slugLabel(m.label));
   let sel = getSelection();
   let period: Period = DEFAULT_PERIOD;
   const authCache = new Map<ProviderId, AuthStatus>();
+  const clipboard = createClipboard();
 
   const refreshAuth = async (): Promise<void> => {
     await Promise.all(
@@ -435,33 +788,47 @@ export async function runTui(): Promise<void> {
   const streamText = new TextRenderable(renderer, { id: "streamText", content: "" });
   stream.add(streamText);
 
-  const metrics = new BoxRenderable(renderer, {
-    id: "metrics",
+  // Two titled frames side by side: plan usage (scoped to the active provider)
+  // on the left, traffic (cache rate + counters) on the right — so the operator
+  // knows which numbers belong to which concern.
+  const metricsRow = new BoxRenderable(renderer, { id: "metricsRow", flexDirection: "row" });
+  const planFrame = new BoxRenderable(renderer, {
+    id: "planFrame",
+    flexGrow: 1,
     border: true,
     borderStyle: "single",
     borderColor: ACCENT,
-    flexDirection: "column",
+    title: " plan ",
+    titleColor: ACCENT,
     paddingLeft: 1,
     paddingRight: 1,
   });
-  // Two sub-areas side by side: plan usage on the left (slice 6), windowed cache
-  // rate + counters on the right; the keybind hints sit on the last line.
-  const metricsRow = new BoxRenderable(renderer, { id: "metricsRow", flexDirection: "row" });
-  const metricsLeft = new BoxRenderable(renderer, { id: "metricsLeft", flexGrow: 1 });
-  const metricsRight = new BoxRenderable(renderer, { id: "metricsRight", flexGrow: 1 });
+  const trafficFrame = new BoxRenderable(renderer, {
+    id: "trafficFrame",
+    flexGrow: 1,
+    border: true,
+    borderStyle: "single",
+    borderColor: ACCENT,
+    title: " traffic ",
+    titleColor: ACCENT,
+    paddingLeft: 1,
+    paddingRight: 1,
+  });
   const planText = new TextRenderable(renderer, { id: "plan", content: "" });
-  const rightText = new TextRenderable(renderer, { id: "right", content: "" });
-  metricsLeft.add(planText);
-  metricsRight.add(rightText);
-  metricsRow.add(metricsLeft);
-  metricsRow.add(metricsRight);
+  const trafficText = new TextRenderable(renderer, { id: "traffic", content: "" });
+  planFrame.add(planText);
+  trafficFrame.add(trafficText);
+  metricsRow.add(planFrame);
+  metricsRow.add(trafficFrame);
+
+  const hintsBar = new BoxRenderable(renderer, { id: "hintsBar", paddingLeft: 1, paddingRight: 1 });
   const hintsText = new TextRenderable(renderer, { id: "hints", content: "" });
-  metrics.add(metricsRow);
-  metrics.add(hintsText);
+  hintsBar.add(hintsText);
 
   app.add(statusBar);
   app.add(stream);
-  app.add(metrics);
+  app.add(metricsRow);
+  app.add(hintsBar);
   renderer.root.add(app);
 
   // Min-size guard: an absolute overlay (out of the app's flow) shown when the
@@ -482,37 +849,147 @@ export async function runTui(): Promise<void> {
   guard.add(guardText);
   renderer.root.add(guard);
 
+  // Modal overlay: a single centered absolute box (same mechanic as the
+  // min-size guard) shared by the pickers and the error detail.
+  const overlayWrap = new BoxRenderable(renderer, {
+    id: "overlayWrap",
+    position: "absolute",
+    top: 0,
+    left: 0,
+    width: "100%",
+    height: "100%",
+    justifyContent: "center",
+    alignItems: "center",
+    visible: false,
+  });
+  const overlayBox = new BoxRenderable(renderer, {
+    id: "overlayBox",
+    border: true,
+    borderStyle: "rounded",
+    borderColor: ACCENT,
+    titleColor: ACCENT,
+    paddingLeft: 1,
+    paddingRight: 1,
+  });
+  const overlayText = new TextRenderable(renderer, { id: "overlayText", content: "" });
+  overlayBox.add(overlayText);
+  overlayWrap.add(overlayBox);
+  renderer.root.add(overlayWrap);
+
+  // --- modal input mode ------------------------------------------------------
+  type Mode =
+    | { kind: "default" }
+    | { kind: "picker"; state: PickerState }
+    | { kind: "error-detail"; row: ReturnType<typeof recentActivity>[number] };
+  let mode: Mode = { kind: "default" };
+
+  const renderHints = (): void => {
+    const chunks: TextChunk[] = [];
+    hintsFor(mode.kind).forEach((hint, i) => {
+      if (i > 0) chunks.push(SPACE, SPACE);
+      const { cap, rest } = keycapParts(hint);
+      chunks.push(cyan(cap));
+      if (rest) chunks.push(dim(rest));
+    });
+    hintsText.content = new StyledText(chunks);
+  };
+
+  const renderOverlay = (): void => {
+    if (mode.kind === "default") {
+      overlayWrap.visible = false;
+      return;
+    }
+    overlayWrap.visible = true;
+    if (mode.kind === "picker") {
+      overlayBox.title = ` ${mode.state.kind} `;
+      overlayText.content = joinLines(
+        pickerRows(mode.state).map((r) => new StyledText([r.active ? bold(cyan(r.text)) : value(r.text)])),
+      );
+    } else {
+      overlayBox.title = " error ";
+      const width = Math.min(56, Math.max(20, renderer.terminalWidth - 8));
+      const maxNoteLines = Math.max(1, renderer.terminalHeight - 8);
+      const lines = errorDetailLines(
+        mode.row,
+        new Date(mode.row.ts).toLocaleTimeString(),
+        width,
+        maxNoteLines,
+      );
+      overlayText.content = joinLines(
+        lines.map((line, i) => new StyledText([i === 0 ? dim(line || " ") : value(line || " ")])),
+      );
+    }
+  };
+
+  const setMode = (next: Mode): void => {
+    mode = next;
+    renderHints();
+    renderOverlay();
+    renderer.requestRender();
+  };
+
+  // Brief meta-strip flash (e.g. copy confirmation); the data poll clears it
+  // on the first render after it expires.
+  let flash: { text: string; level: "ok" | "warn"; until: number } | null = null;
+  const showFlash = (text: string, level: "ok" | "warn"): void => {
+    flash = { text, level, until: Date.now() + FLASH_MS };
+    render();
+  };
+
   // Rows are read on the data poll and cached so the ~100ms animation tick can
   // re-render the spinner + live elapsed of in-flight rows without re-hitting
   // the store. The inner content area excludes the border (2 rows / 2 cols) and
   // the horizontal padding (2 cols); fall back to a small size before first layout.
   let cachedRows: ReturnType<typeof recentActivity> = [];
+  let inFlight = 0;
   const streamInner = (): { h: number; w: number } => ({
     h: stream.height > 2 ? stream.height - 2 : 8,
     w: stream.width > 4 ? stream.width - 4 : 40,
   });
   const renderStream = (innerWidth: number, now: number): void => {
-    streamText.content = cachedRows.length
-      ? joinLines(cachedRows.map((r) => activityLine(r, innerWidth, now)))
-      : new StyledText([dim("(no activity yet)")]);
+    stream.title = activityTitle(inFlight, now);
+    if (!cachedRows.length) {
+      const empty = emptyState(endpoint.url);
+      streamText.content = joinLines([
+        new StyledText([dim(empty.headline)]),
+        new StyledText([value(empty.url)]),
+        new StyledText([dim(empty.hint)]),
+      ]);
+      return;
+    }
+    const padded = padColumns(
+      cachedRows.map((r) =>
+        activityColumns(r, new Date(r.ts).toLocaleTimeString(), now, { labels: modelLabels }),
+      ),
+    );
+    streamText.content = joinLines(
+      padded.map((cells) => {
+        const kept = clipColumns(cells, innerWidth, COL_GAP);
+        const chunks: TextChunk[] = [];
+        kept.forEach((cell, i) => {
+          if (i > 0) chunks.push(value(" ".repeat(COL_GAP)));
+          chunks.push(colourCell(cell));
+        });
+        return new StyledText(chunks);
+      }),
+    );
   };
 
-  // Collapse the plan-usage sub-area (width 0, hidden) when the active provider
-  // has no plan usage, so the cache-rate + counters sub-area reclaims the space;
-  // guarded so the layout only reflows on an actual state change.
+  // Collapse the plan frame (width 0, hidden) when the active provider has no
+  // plan usage, so the traffic frame reclaims the space; guarded so the layout
+  // only reflows on an actual state change.
   let planCollapsed = false;
   const setPlanCollapsed = (collapsed: boolean): void => {
     if (collapsed === planCollapsed) return;
     planCollapsed = collapsed;
-    metricsLeft.visible = !collapsed;
-    metricsLeft.flexGrow = collapsed ? 0 : 1;
-    metricsLeft.width = collapsed ? 0 : "auto";
+    planFrame.visible = !collapsed;
+    planFrame.flexGrow = collapsed ? 0 : 1;
+    planFrame.width = collapsed ? 0 : "auto";
   };
 
-  // Static content: the endpoint is fixed at startup (config is immutable at
-  // runtime) and the hints never change, so neither is rebuilt per render.
+  // The endpoint is fixed at startup (config is immutable at runtime).
   const endpoint = formatEndpoint(TUNNEL_HOSTNAME, PORT);
-  hintsText.content = new StyledText([dim("p provider · m model · e effort · w window · q quit")]);
+  renderHints();
 
   // --- render: data → props ------------------------------------------------
   const render = (): void => {
@@ -522,6 +999,7 @@ export async function runTui(): Promise<void> {
     // message; the overlay is absolute so the app's layout is untouched.
     if (isTerminalTooSmall(renderer.terminalWidth, renderer.terminalHeight)) {
       app.visible = false;
+      overlayWrap.visible = false;
       guard.visible = true;
       guardText.content = new StyledText([yellow(`terminal too small — need at least ${MIN_COLS}×${MIN_ROWS}`)]);
       renderer.requestRender();
@@ -529,6 +1007,7 @@ export async function runTui(): Promise<void> {
     }
     app.visible = true;
     guard.visible = false;
+    overlayWrap.visible = mode.kind !== "default";
 
     // tier 1: active selection, highlighted as the control anchor (bold accent
     // values, dim labels) so the operator always knows which backend serves traffic.
@@ -542,8 +1021,9 @@ export async function runTui(): Promise<void> {
       bold(cyan(sel.effort)),
     ]);
 
-    // tier 2: dim meta strip — endpoint, tunnel state, and per-provider auth
-    // dots; a down provider surfaces its error detail inline.
+    // tier 2: dim meta strip — endpoint, tunnel state, per-provider auth dots,
+    // and the transient flash (e.g. `copied ✓`); a down provider surfaces its
+    // error detail inline.
     const metaChunks: TextChunk[] = [
       dim(`${endpoint.url}  `),
       endpoint.tunnel === "up" ? green("tunnel up") : yellow("no tunnel"),
@@ -554,49 +1034,68 @@ export async function runTui(): Promise<void> {
       const dot = state === "ok" ? green("●") : state === "down" ? red("●") : dim("●");
       metaChunks.push(SPACE, SPACE, dot, dim(` ${formatAuthMeta(p.id, a)}`));
     }
+    if (flash && now <= flash.until) {
+      metaChunks.push(SPACE, SPACE, (flash.level === "ok" ? green : yellow)(flash.text));
+    } else {
+      flash = null;
+    }
     metaText.content = new StyledText(metaChunks);
 
     // center: activity stream (newest first), auto-filling the pane — read and
-    // cache the rows, then render them with the current `now`.
+    // cache the rows + in-flight count, then render them with the current `now`.
     const inner = streamInner();
     cachedRows = recentActivity(inner.h);
+    inFlight = pendingCount();
     renderStream(inner.w, now);
 
-    // bottom-left: plan usage, scoped to the active provider. A provider that
-    // does not capture plan usage (e.g. codex) collapses the block so the right
-    // sub-area reclaims the space; a capable provider with no snapshot yet shows
-    // "no data yet"; otherwise two bars, each optimistically reset once its
-    // window's reset boundary has passed.
+    // bottom-left: plan usage, scoped to (and titled with) the active provider.
+    // A provider that does not capture plan usage (e.g. codex) collapses the
+    // frame; a capable provider with no snapshot yet shows "no data yet";
+    // otherwise two bars, each optimistically reset once its window's reset
+    // boundary has passed. Level colour applies to the bar + percent only, so
+    // the countdown stays readable regardless of usage level.
     const provider = getProvider(sel.provider);
     if (!provider.reportsPlanUsage) {
       setPlanCollapsed(true);
     } else {
       setPlanCollapsed(false);
+      planFrame.title = ` plan · ${sel.provider} `;
       const usage = getPlanUsage(sel.provider);
       if (!usage) {
-        planText.content = new StyledText([dim(`plan usage (${sel.provider})  (no data yet)`)]);
+        planText.content = new StyledText([dim("(no data yet)")]);
       } else {
         const bar = (label: string, raw: PlanWindow): StyledText => {
           const w = optimisticReset(raw, now);
-          const lvl = usageLevel(w.utilization);
-          const color = lvl === "crit" ? red : lvl === "warn" ? yellow : green;
-          return new StyledText([color(formatPlanUsage(label, w, now))]);
+          const parts = planUsageParts(label, w, now);
+          const chunks: TextChunk[] = [
+            dim(parts.label),
+            LEVEL_COLOR[usageLevel(w.utilization)](`${parts.bar} ${parts.pct}`),
+            value(`  ${parts.reset}`),
+          ];
+          if (parts.flag) chunks.push(red(`  ${parts.flag}`));
+          return new StyledText(chunks);
         };
         planText.content = joinLines([bar("5h", usage.fiveHour), bar("weekly", usage.weekly)]);
       }
     }
 
-    // bottom-right: live cache rate + counters. The cache rate is scoped to the
-    // last N measured requests (converges within one response); the `w` period
-    // scopes only the request/error counters. In-flight is live.
-    const since = periodSince(period, now);
-    const counters = { ...windowedCounters(since), inFlight: pendingCount() };
-    // One source for the sample size so the totals and the label can't drift.
-    const sample = CACHE_RATE_SAMPLE;
-    rightText.content = joinLines([
-      new StyledText([dim(formatCacheRate(cacheTotalsRecent(sample), sample))]),
-      new StyledText([dim(formatCounters(counters, period))]),
-    ]);
+    // bottom-right: traffic — cache rate (per-request sparkline + aggregate,
+    // both derived from the same recent sample) and the windowed counters.
+    const samples = recentCacheSamples(CACHE_RATE_SAMPLE);
+    const rate = cacheRateView(samples, CACHE_RATE_SAMPLE);
+    const rateChunks: TextChunk[] = [dim(`${rate.label}  `)];
+    if (rate.spark) rateChunks.push(value(rate.spark), value("  "));
+    rateChunks.push(value(rate.value));
+    if (rate.detail) rateChunks.push(dim(`  (${rate.detail})`));
+
+    const counters = windowedCounters(periodSince(period, now));
+    const counterChunks: TextChunk[] = [];
+    countersView(counters, period).forEach((part, i) => {
+      if (i > 0) counterChunks.push(dim("  ·  "));
+      counterChunks.push(dim(`${part.label} `));
+      counterChunks.push(part.label === "errors" && counters.errors > 0 ? red(part.value) : value(part.value));
+    });
+    trafficText.content = joinLines([new StyledText(rateChunks), new StyledText(counterChunks)]);
 
     renderer.requestRender();
   };
@@ -607,33 +1106,15 @@ export async function runTui(): Promise<void> {
     render();
   };
 
-  const cycleProvider = (): void => {
-    const i = providerIds.indexOf(sel.provider);
-    const nextId = providerIds[(i + 1) % providerIds.length] as ProviderId;
-    const first = getProvider(nextId).models()[0];
-    if (!first) return;
-    commit({ provider: nextId, model: first.id, effort: preserveEffort(first.efforts, sel.effort) });
+  const openPickerFor = (kind: PickerKind): void => {
+    const state = openPicker(kind, sel, catalog);
+    if (!state) return;
+    setMode({ kind: "picker", state });
   };
 
-  const cycleModel = (): void => {
-    const models = getProvider(sel.provider).models();
-    const i = models.findIndex((m) => m.id === sel.model);
-    const next = models[(i + 1) % models.length];
-    if (!next) return;
-    commit({ ...sel, model: next.id, effort: preserveEffort(next.efforts, sel.effort) });
-  };
-
-  const cycleEffort = (): void => {
-    const model = getProvider(sel.provider).models().find((m) => m.id === sel.model);
-    const efforts = model?.efforts ?? [];
-    if (!efforts.length) return;
-    const i = efforts.indexOf(sel.effort);
-    commit({ ...sel, effort: efforts[(i + 1) % efforts.length] as Effort });
-  };
-
-  const cyclePeriod = (): void => {
-    period = nextPeriod(period);
-    render();
+  const copyEndpoint = async (): Promise<void> => {
+    const ok = await clipboard.copy(endpoint.url);
+    showFlash(ok ? "copied ✓" : "copy failed — no clipboard", ok ? "ok" : "warn");
   };
 
   let dataTimer: ReturnType<typeof setInterval> | undefined;
@@ -648,26 +1129,67 @@ export async function runTui(): Promise<void> {
     process.exit(0);
   };
 
+  /** Trigger key per picker kind — pressing it again advances the highlight. */
+  const TRIGGER: Record<PickerKind, string> = { provider: "p", model: "m", effort: "e" };
+
   renderer.keyInput.on("keypress", (key: KeyEvent) => {
     if (key.ctrl && key.name === "c") return quit();
+
+    // Modal input modes: global keys are inert while an overlay is open.
+    if (mode.kind === "picker") {
+      const state = mode.state;
+      switch (key.name) {
+        case "up":
+          return setMode({ kind: "picker", state: movePicker(state, -1) });
+        case "down":
+          return setMode({ kind: "picker", state: movePicker(state, 1) });
+        case "return":
+          commit(commitPicker(state, sel, catalog));
+          return setMode({ kind: "default" });
+        case "escape":
+          return setMode({ kind: "default" });
+        default:
+          // Repeat-trigger advance: the old fast-cycling muscle memory.
+          if (key.name === TRIGGER[state.kind]) {
+            return setMode({ kind: "picker", state: movePicker(state, 1) });
+          }
+          return;
+      }
+    }
+    if (mode.kind === "error-detail") {
+      if (key.name === "escape" || key.name === "return") return setMode({ kind: "default" });
+      return;
+    }
+
     switch (key.name) {
       case "p":
-        return cycleProvider();
+        return openPickerFor("provider");
       case "m":
-        return cycleModel();
+        return openPickerFor("model");
       case "e":
-        return cycleEffort();
+        return openPickerFor("effort");
       case "w":
-        return cyclePeriod();
+        period = nextPeriod(period);
+        return render();
+      case "c":
+        return void copyEndpoint();
       case "q":
         return quit();
+      case "return": {
+        const row = latestError(cachedRows);
+        if (!row) return showFlash("no recent error", "warn");
+        return setMode({ kind: "error-detail", row });
+      }
     }
   });
 
   // Reflow immediately on terminal resize (Yoga relayouts the flex zones; this
-  // re-derives the size-dependent content — stream auto-fill/clip and the
-  // min-size guard — without waiting for the next poll).
-  renderer.on("resize", () => render());
+  // re-derives the size-dependent content — stream auto-fill/clip, the modal
+  // overlay, and the min-size guard — without waiting for the next poll).
+  renderer.on("resize", () => {
+    render();
+    renderOverlay();
+  });
 
   await refreshAuth();
   render();
@@ -676,9 +1198,10 @@ export async function runTui(): Promise<void> {
     sel = getSelection();
     render();
   }, DATA_POLL_MS);
-  // Animation tick advances the spinner + live elapsed of in-flight rows only,
-  // re-rendering the stream from the cached rows (no store read) and only while
-  // something is actually pending — so a quiet panel does no work.
+  // Animation tick advances the spinner + live elapsed of in-flight rows (and
+  // the in-flight frame title) only, re-rendering the stream from the cached
+  // rows (no store read) and only while something is actually pending — so a
+  // quiet panel does no work.
   renderTimer = setInterval(() => {
     if (!cachedRows.some((r) => r.status === "pending")) return;
     renderStream(streamInner().w, Date.now());
